@@ -32,6 +32,8 @@ GENERAL_TARGET_FIELDS = [
     "Facility State",
     "Facility Zip Code",
     "Facility County",
+    "NAICS Code",
+    "Industry Description",
     "Permit Number",
     "Issuance Date",
     "Expiration Date",
@@ -42,9 +44,11 @@ GENERAL_TARGET_FIELDS = [
 UNIT_DETAIL_FIELDS = [
     "Unit ID",
     "Unit Description",
-    "Pollutants", # Could be a list or comma-separated string
-    "Emission Limits", # Could be complex; aim for text description for now
-    "Control Device(s)"
+    "Pollutants",  # Could be a list or comma-separated string
+    "Emission Limits",  # Could be complex; aim for text description for now
+    "Control Device(s)",
+    "Capacity",  # e.g., MMBtu/hr, tons/year
+    "Fuel Type",  # e.g., Natural Gas, Coal, etc.
 ]
 # All fields expected in the final Excel output
 ALL_OUTPUT_FIELDS = GENERAL_TARGET_FIELDS + UNIT_DETAIL_FIELDS
@@ -139,7 +143,7 @@ def extract_text_from_pdf(pdf_path):
             for page_num in range(num_pages):
                 page = reader.pages[page_num]
                 text += page.extract_text() or ""  # fallback for blank pages
-        print(f"  Successfully extracted text from {pdf_path.name}.")
+            print(f"  Successfully extracted text from {pdf_path.name}.")
         return text
     except FileNotFoundError:
         print(f"  Error: File not found at {pdf_path}")
@@ -288,13 +292,12 @@ def extract_info_with_llm(model, text, filename):
 
 @app.command()
 def main():
-    # ---- REPLACE THIS WITH YOUR OWN CODE ----
     logger.info("Processing dataset...")
     for i in tqdm(range(10), total=10):
         if i == 5:
             logger.info("Something happened for iteration 5.")
     logger.success("Processing dataset complete.")
-    # -----------------------------------------
+
     logging.info("Starting Air Permit Extraction Process...")
 
     llm_model = configure_llm()
