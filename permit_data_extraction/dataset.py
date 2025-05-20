@@ -12,16 +12,16 @@ from dotenv import dotenv_values
 from loguru import logger
 from tqdm import tqdm
 
-from permit_data_extraction.config import RAW_DATA_DIR, INTERIM_DATA_DIR
+from permit_data_extraction.config import RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR
 
 app = typer.Typer()
 
 API_KEY = dotenv_values()['API_KEY']
 
-PERMIT_DIR = RAW_DATA_DIR
+TEXT_INPUT_DIR = INTERIM_DATA_DIR / 'extracted_text'
 
 # Path for the output Excel file
-OUTPUT_EXCEL_FILE = os.path.join(INTERIM_DATA_DIR,
+OUTPUT_EXCEL_FILE = os.path.join(PROCESSED_DATA_DIR,
                                  'permit_data_extracted.xlsx')
 
 # General permit info
@@ -153,43 +153,50 @@ def extract_text_from_pdf(pdf_path):
         return None
 
 
-def extract_info_with_llm(model, text, filename):
+def read_text_from_file(file_path):
+    """Reads text content from a given file path."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        logging.info(f"  Successfully read text from {file_path.name} (approx {len(content)} chars).")
+        return content
+    except FileNotFoundError:
+        logging.error(f"  Error: Text file not found at {file_path}")
+        return None
+    except Exception as e:
+        logging.error(f"  Error reading text file {file_path.name}: {e}", exc_info=True)
+        return None
+
+
+def extract_info_with_llm(model, text_content, filename):
     """Sends text to the LLM and attempts to parse the JSON response."""
-    if not model or not text:
-        logging.warning(f"""  Skipping LLM call for {filename}
-                         due to missing model or text.""")
+    if not model or not text_content:
+        logging.warning(f"  Skipping LLM call for {filename} due to missing model or text.")
         return None
 
     try:
-        prompt = PROMPT_TEMPLATE.format(permit_text=text)
+        prompt = PROMPT_TEMPLATE.format(permit_text=text_content)
     except Exception as format_e:
-        logging.error(f"""  Internal Error: An unexpected error occurred
-                       during prompt formatting: {format_e}""",
-                      exc_info=True)
+        logging.error(f"  Internal Error: An unexpected error occurred during prompt formatting: {format_e}", exc_info=True)
         return None
 
     safety_settings = [
-        {"category": "HARM_CATEGORY_HARASSMENT",
-         "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH",
-         "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-         "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-         "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
     ]
     generation_config = {
-        "temperature": 0.1,  # Very low temperature for fact-based extraction
+        "temperature": 0.1,
         "top_p": 1.0,
         "top_k": 1,
-        "max_output_tokens": 8192,  # Increased further for many units
+        "max_output_tokens": 8192,
         "response_mime_type": "application/json",
     }
 
-    logging.info(f"""  Sending text from {filename} to LLM
-                 (approx {len(text)} chars)...""")
+    logging.info(f"  Sending text from {filename} to LLM (approx {len(text_content)} chars)...")
     try:
-        time.sleep(1.5)  # Slightly longer delay for more complex requests
+        time.sleep(1.5) # API call delay
 
         response = model.generate_content(
             prompt,
@@ -198,215 +205,146 @@ def extract_info_with_llm(model, text, filename):
             )
 
         extracted_data = None
-        json_text = None  # Initialize json_text for except blocks
+        json_text_response = None # For logging in case of error
 
         if response and response.parts:
-            try:
-                # Extract the text content believed to be JSON
-                json_text = response.parts[0].text
-                # Attempt to parse the JSON
-                extracted_data = json.loads(json_text)
-                logging.info(f"""  Successfully extracted and parsed JSON
-                             from {filename}.""")
-                # Basic validation
-                if "Emission Units" not in extracted_data or not isinstance(
-                        extracted_data.get("Emission Units"), list):
-                    logging.warning(f"""  LLM response for {filename} parsed,
-                                    but 'Emission Units' key is missing or not
-                                    a list. Treating as no units found.""")
-                    extracted_data["Emission Units"] = []
-                return extracted_data
-            except json.JSONDecodeError as json_e:
-                # *** MODIFICATION START ***
-                # Log the specific error AND the problematic text
-                # if parsing fails
-                logging.error(f"""  Failed to decode JSON from response part
-                              for {filename}. Error: {json_e}""")
-                logging.error(f"""  Problematic JSON text received from LLM for
-                              {filename}:\n--- START MALFORMED JSON ---
-                              \n{json_text}\n--- END MALFORMED JSON ---""")
-                # *** MODIFICATION END ***
-                return None  # Continue returning None after logging
-            except (IndexError, AttributeError, TypeError) as e:
-                # Handle other potential errors accessing response parts
-                logging.error(f"""  Failed to access or process response part
-                              for {filename}. Error: {e}""")
-                # Log the raw response if possible for debugging
-                try:
-                    logging.error(f"""  Raw response part content
-                                  (if available):
-                                  {response.parts[0].text[:1000]}...""")
-                except:
-                    logging.error("""  Could not retrieve raw response part
-                                  content for logging.""")
-                return None
-        # Fallback attempt if response.parts wasn't the primary way
-        # data was returned (less likely with mime_type=json)
-        elif hasattr(response, 'text') and response.text:
-            logging.info("  Attempting fallback parsing from response.text...")
-            try:
-                json_text = response.text.strip().lstrip('```json').rstrip(
-                    '```').strip()
-                extracted_data = json.loads(json_text)
-                logging.info(f"""  Successfully extracted and parsed JSON from
-                              {filename} using fallback.""")
-                if "Emission Units" not in extracted_data or not isinstance(
-                        extracted_data.get("Emission Units"), list):
-                    logging.warning(f"""  LLM fallback response for {filename}
-                                    parsed, but 'Emission Units' key invalid.
-                                    Treating as no units found.""")
-                    extracted_data["Emission Units"] = []
-                return extracted_data
-            except json.JSONDecodeError as json_e_fallback:
-                # *** MODIFICATION START ***
-                logging.error(f"""  Fallback JSON decoding failed for
-                              {filename}. Error: {json_e_fallback}""")
-                logging.error(f"""  Problematic JSON text received from LLM
-                              (Fallback) for {filename}:\n--- START MALFORMED
-                              JSON ---\n{json_text}\n--- END MALFORMED JSON ---
-                              """)
-                # *** MODIFICATION END ***
-                return None
-            except Exception as fallback_e:
-                logging.error(f"""  Error during fallback parsing for
-                              {filename}: {fallback_e}""",
-                              exc_info=True)
-                return None
+             try:
+                 json_text_response = response.parts[0].text
+                 extracted_data = json.loads(json_text_response)
+                 logging.info(f"  Successfully extracted and parsed JSON from {filename}.")
+                 if "Emission Units" not in extracted_data or not isinstance(extracted_data.get("Emission Units"), list):
+                     logging.warning(f"  LLM response for {filename} parsed, but 'Emission Units' key is missing or not a list. Treating as no units found.")
+                     extracted_data["Emission Units"] = []
+                 return extracted_data
+             except json.JSONDecodeError as json_e:
+                 logging.error(f"  Failed to decode JSON from response part for {filename}. Error: {json_e}")
+                 logging.error(f"  Problematic JSON text received from LLM for {filename}:\n--- START MALFORMED JSON ---\n{json_text_response}\n--- END MALFORMED JSON ---")
+                 return None
+             except (IndexError, AttributeError, TypeError) as e:
+                 logging.error(f"  Failed to access or process response part for {filename}. Error: {e}")
+                 try:
+                     logging.error(f"  Raw response part content (if available): {response.parts[0].text[:1000]}...")
+                 except:
+                     logging.error("  Could not retrieve raw response part content for logging.")
+                 return None
+        elif hasattr(response, 'text') and response.text: # Fallback
+             logging.info("  Attempting fallback parsing from response.text...")
+             try:
+                 json_text_response = response.text.strip().lstrip('```json').rstrip('```').strip()
+                 extracted_data = json.loads(json_text_response)
+                 # ... (rest of fallback logic as in previous script)
+                 logging.info(f"  Successfully extracted and parsed JSON from {filename} using fallback.")
+                 if "Emission Units" not in extracted_data or not isinstance(extracted_data.get("Emission Units"), list):
+                     logging.warning(f"  LLM fallback response for {filename} parsed, but 'Emission Units' key invalid. Treating as no units found.")
+                     extracted_data["Emission Units"] = []
+                 return extracted_data
+             except json.JSONDecodeError as json_e_fallback:
+                 logging.error(f"  Fallback JSON decoding failed for {filename}. Error: {json_e_fallback}")
+                 logging.error(f"  Problematic JSON text received from LLM (Fallback) for {filename}:\n--- START MALFORMED JSON ---\n{json_text_response}\n--- END MALFORMED JSON ---")
+                 return None
+             except Exception as fallback_e:
+                  logging.error(f"  Error during fallback parsing for {filename}: {fallback_e}", exc_info=True)
+                  return None
         else:
-            # Handle cases where the response structure is unexpected or empty
-            raw_response_content = str(response)  # Attempt to get string
-            logging.error(f"""  LLM response was empty or malformed for
-                          {filename}.""")
-            logging.debug(f"""  Raw Response object (stringified):
-                          {raw_response_content[:1000]}...""")
-            return None
-
+             raw_response_content = str(response)
+             logging.error(f"  LLM response was empty or malformed for {filename}.")
+             logging.debug(f"  Raw Response object (stringified): {raw_response_content[:1000]}...")
+             return None
     except Exception as e:
-        # Catch other potential API errors (rate limits, auth, etc.)
-        logging.error(f"  Error during LLM API call for {filename}: {e}",
-                      exc_info=True)
+        logging.error(f"  Error during LLM API call for {filename}: {e}", exc_info=True)
         if "API key not valid" in str(e):
-            logging.error("  Hint: Double-check your GOOGLE_API_KEY setting.")
+             logging.error("  Hint: Double-check your GOOGLE_API_KEY setting.")
         return None
 
 
 @app.command()
 def main():
-    logger.info("Processing dataset...")
-    for i in tqdm(range(10), total=10):
-        if i == 5:
-            logger.info("Something happened for iteration 5.")
-    logger.success("Processing dataset complete.")
-
-    logging.info("Starting Air Permit Extraction Process...")
+    logging.info("Starting LLM Extraction Process from Text Files...")
 
     llm_model = configure_llm()
     if not llm_model:
         logging.critical("Exiting due to LLM configuration error.")
         return
 
-    if not PERMIT_DIR.is_dir():
-        logging.critical(f"""Error: Permit directory not found at
-                         '{PERMIT_DIR}'.
-                         Please create it and add PDF files.""")
+    if not TEXT_INPUT_DIR.is_dir():
+        logging.critical(f"Error: Text input directory not found at '{TEXT_INPUT_DIR}'. This directory should contain .txt files from the ocr_processor.py script.")
         return
 
-    pdf_files = list(PERMIT_DIR.glob('*.pdf'))
-    if not pdf_files:
-        logging.warning(f"""No PDF files found in '{PERMIT_DIR}'. Ensure files
-                        end with '.pdf'.""")
+    text_files = list(TEXT_INPUT_DIR.glob('*.txt'))
+    if not text_files:
+        logging.warning(f"No .txt files found in '{TEXT_INPUT_DIR}'.")
         return
 
-    logging.info(f"Found {len(pdf_files)} PDF files to process.")
+    logging.info(f"Found {len(text_files)} .txt files to process.")
+    processed_data_rows = []
 
-    processed_data_rows = []  # Will store dicts, each representing a row
+    for txt_file_path in text_files:
+        logging.info(f"\nProcessing text file: {txt_file_path.name}")
+        original_filename = txt_file_path.stem # Assumes .txt was added to original PDF stem
 
-    for pdf_path in pdf_files:
-        logging.info(f"\nProcessing file: {pdf_path.name}")
-        filename = pdf_path.name  # Store filename for logging/reporting
-
-        # 1. Extract Text
-        permit_text = extract_text_from_pdf(pdf_path)
-        if not permit_text:
-            logging.warning(f"""  Skipping file {filename} due to text
-                             extraction error or empty content.""")
-            # Log basic failure info if needed, though handled later
-            processed_data_rows.append({"Filename": filename,
-                                        "Status": "Text Extraction Failed",
-                                        **{field: "ERROR" for field in ALL_OUTPUT_FIELDS}})
+        permit_text_content = read_text_from_file(txt_file_path)
+        if not permit_text_content:
+            logging.warning(f"  Skipping file {original_filename} due to text reading error or empty content.")
+            processed_data_rows.append({"Filename": original_filename, "Status": "Text Reading Failed", **{field: "ERROR" for field in ALL_OUTPUT_FIELDS}})
             continue
 
-        # Basic text length check
-        MAX_CHARS = 1500000  # Adjust as needed, Gemini 1.5 has large context
-        if len(permit_text) > MAX_CHARS:
-            logging.warning(f"""  Text from {filename} is very long
-                             ({len(permit_text)} chars). 
-                             Processing may be slow/costly.""")
-            # Consider truncation or chunking for extremely large files.
-            # permit_text = permit_text[:MAX_CHARS]
+        # MAX_CHARS check can still be useful here if there's a concern about LLM input limits
+        MAX_CHARS = 1500000 # Example
+        if len(permit_text_content) > MAX_CHARS:
+            logging.warning(f"  Text from {original_filename} is very long ({len(permit_text_content)} chars). Processing may be slow/costly.")
+            # permit_text_content = permit_text_content[:MAX_CHARS] # Optional truncation
 
-        # 2. Extract Info using LLM
-        extracted_info = extract_info_with_llm(llm_model,
-                                               permit_text,
-                                               filename)
+        extracted_info = extract_info_with_llm(llm_model, permit_text_content, original_filename)
 
-        # 3. Process Results and Create Rows
+        # Process results (same logic as before)
         if extracted_info and isinstance(extracted_info, dict):
             general_info = {field: extracted_info.get(field) for field in GENERAL_TARGET_FIELDS}
             emission_units = extracted_info.get("Emission Units", [])
 
-            if isinstance(emission_units, list) and emission_units:
-                logging.info(f"""  Extracted {len(emission_units)}
-                             emission units from {filename}.""")
+            if not isinstance(emission_units, list):
+                logging.warning(f"  'Emission Units' field in response for {original_filename} was not a list. Treating as no units found. Value: {emission_units}")
+                emission_units = []
+
+            if emission_units:
+                logging.info(f"  Extracted {len(emission_units)} emission units from {original_filename}.")
                 for unit in emission_units:
-                    if isinstance(unit, dict): # Ensure unit is a dictionary
-                        row_data = {"Filename": filename, "Status": "Success"}
-                        row_data.update(general_info) # Add general permit info
-                        # Add unit details, using .get() for safety
+                    if isinstance(unit, dict):
+                        row_data = {"Filename": original_filename, "Status": "Success"}
+                        row_data.update(general_info)
                         for field in UNIT_DETAIL_FIELDS:
                             row_data[field] = unit.get(field)
                         processed_data_rows.append(row_data)
                     else:
-                        logging.warning(f"""  Skipping invalid unit
-                                        entry in {filename}: {unit}""")
-                        # Optionally log a row indicating a malformed unit
-                        row_data = {"Filename": filename,
-                                    "Status": "Malformed Unit Data"}
+                        logging.warning(f"  Skipping invalid unit entry (not a dict) in {original_filename}: {unit}")
+                        # ... (malformed unit data logging as before)
+                        row_data = {"Filename": original_filename, "Status": "Malformed Unit Data"}
                         row_data.update(general_info)
-                        for field in UNIT_DETAIL_FIELDS:
-                            row_data[field] = "INVALID UNIT ENTRY"
+                        for field in UNIT_DETAIL_FIELDS: row_data[field] = "INVALID UNIT ENTRY"
                         processed_data_rows.append(row_data)
 
             else:
-                # Permit processed, but no units found or unit list was empty
-                logging.info(f"""  No valid emission units extracted
-                             or found for {filename}.""")
-                row_data = {"Filename": filename, 
-                            "Status": "Success (No Units Found)"}
+                logging.info(f"  No valid emission units extracted or found for {original_filename}.")
+                # ... (no units found logging as before)
+                row_data = {"Filename": original_filename, "Status": "Success (No Units Found)"}
                 row_data.update(general_info)
-                # Add null/empty placeholders for unit fields
-                for field in UNIT_DETAIL_FIELDS: 
-                    row_data[field] = None
+                for field in UNIT_DETAIL_FIELDS: row_data[field] = None
                 processed_data_rows.append(row_data)
         else:
-            # LLM extraction failed completely for this file
-            logging.error(f"  Failed to extract information from {filename}.")
-            processed_data_rows.append({"Filename": filename,
-                                        "Status": "LLM Extraction Failed",
-                                        **{field: "ERROR" for field in ALL_OUTPUT_FIELDS}})
+            logging.error(f"  Failed to extract information from {original_filename} (LLM call returned None or invalid data).")
+            # ... (LLM extraction failed logging as before)
+            processed_data_rows.append({"Filename": original_filename, "Status": "LLM Extraction Failed", **{field: "ERROR" for field in ALL_OUTPUT_FIELDS}})
 
-    # 4. Save to Excel
+
+    # Save to Excel (same logic as before)
     if processed_data_rows:
         logging.info(f"\nSaving extracted data to {OUTPUT_EXCEL_FILE}...")
         try:
             df = pd.DataFrame(processed_data_rows)
-            # Define final column order including Filename and Status
             excel_columns = ["Filename", "Status"] + ALL_OUTPUT_FIELDS
-            # Ensure all expected columns exist, adding missing ones with None
             for col in excel_columns:
                 if col not in df.columns:
                     df[col] = None
-            df = df[excel_columns] # Reorder/select columns
+            df = df[excel_columns]
             df.to_excel(OUTPUT_EXCEL_FILE, index=False, engine='openpyxl')
             logging.info(f"Data successfully saved to '{OUTPUT_EXCEL_FILE}'.")
         except Exception as e:
@@ -414,7 +352,7 @@ def main():
     else:
         logging.warning("No data was processed to save.")
 
-    logging.info("\nExtraction process finished.")
+    logging.info("\nLLM Extraction process finished.")
 
 
 if __name__ == "__main__":
