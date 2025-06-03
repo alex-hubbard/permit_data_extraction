@@ -19,7 +19,7 @@ API_KEY = dotenv_values()['API_KEY']
 
 # Configure Gemini API
 genai.configure(api_key=API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-2.0-flash')
 
 # Rate limiting settings
 RATE_LIMIT_DELAY = 60  # seconds to wait between batches
@@ -38,12 +38,30 @@ def extract_fields_with_gemini(text: str) -> Dict[str, List[str]]:
         Dict[str, List[str]]: Dictionary of field names and their potential values
     """
     prompt = """
-    Analyze this permit text and identify all possible data fields and their values.
+    Analyze this permit text and identify possible data fields and their values, such as:
+    - Permit number
+    - Facility name
+    - Facility address
+    - Facility type
+    - Facility use
+    - Facility size
+    - Facility capacity
+    - Facility hours
+    - Equipment types
+    - Equipment sizes
+    - Equipment capacities
+    - Equipment hours
+    - Equipment use
+    - Equipment location
+    - Equipment address
+    - Etc.  
+    
     Return the results as a JSON object where:
     - Keys are the field names (e.g., "permit_number", "applicant_name", "project_cost")
     - Values are lists of the values found for each field
     
     Only include fields that have clear values in the text.
+    Use general field names that are common in permit applications. Group similar fields together.
     Format the response as a valid JSON object.
     
     Text to analyze:

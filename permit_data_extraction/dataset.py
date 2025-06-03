@@ -1,4 +1,3 @@
-
 import json
 import logging
 import os
@@ -33,6 +32,7 @@ GENERAL_TARGET_FIELDS = [
     "Facility Zip Code",
     "Facility County",
     "NAICS Code",
+    "Operating Hours",
     "Industry Description",
     "Permit Number",
     "Issuance Date",
@@ -40,15 +40,20 @@ GENERAL_TARGET_FIELDS = [
     "Regulatory Authority",
     "Primary Applicable Regulations (e.g., Title V, PSD, NESHAP Subpart)"
 ]
+
 # Specific fields for each emission unit
 UNIT_DETAIL_FIELDS = [
     "Unit ID",
     "Unit Description",
+    "Unit Make",
+    "Unit Model",
+    "Unit Type", # especially for boilers, furnaces, etc.
     "Pollutants",  # Could be a list or comma-separated string
     "Emission Limits",  # Could be complex; aim for text description for now
     "Control Device(s)",
     "Capacity",  # e.g., MMBtu/hr, tons/year
     "Fuel Type",  # e.g., Natural Gas, Coal, etc.
+    "Rated Efficiency", # e.g., 90%
 ]
 # All fields expected in the final Excel output
 ALL_OUTPUT_FIELDS = GENERAL_TARGET_FIELDS + UNIT_DETAIL_FIELDS
@@ -123,7 +128,7 @@ def configure_llm():
     try:
         genai.configure(api_key=API_KEY)
         # Choose the Gemini model - check availability and suitability
-        model = genai.GenerativeModel('gemini-1.5-flash')  # Can switch model
+        model = genai.GenerativeModel('gemini-2.0-flash')  # Can switch model
         print("Google Generative AI configured successfully.")
         return model
     except Exception as e:
@@ -191,7 +196,6 @@ def extract_info_with_llm(model, text_content, filename):
         "top_p": 1.0,
         "top_k": 1,
         "max_output_tokens": 8192,
-        "response_mime_type": "application/json",
     }
 
     logging.info(f"  Sending text from {filename} to LLM (approx {len(text_content)} chars)...")
@@ -207,53 +211,39 @@ def extract_info_with_llm(model, text_content, filename):
         extracted_data = None
         json_text_response = None # For logging in case of error
 
-        if response and response.parts:
-             try:
-                 json_text_response = response.parts[0].text
-                 extracted_data = json.loads(json_text_response)
-                 logging.info(f"  Successfully extracted and parsed JSON from {filename}.")
-                 if "Emission Units" not in extracted_data or not isinstance(extracted_data.get("Emission Units"), list):
-                     logging.warning(f"  LLM response for {filename} parsed, but 'Emission Units' key is missing or not a list. Treating as no units found.")
-                     extracted_data["Emission Units"] = []
-                 return extracted_data
-             except json.JSONDecodeError as json_e:
-                 logging.error(f"  Failed to decode JSON from response part for {filename}. Error: {json_e}")
-                 logging.error(f"  Problematic JSON text received from LLM for {filename}:\n--- START MALFORMED JSON ---\n{json_text_response}\n--- END MALFORMED JSON ---")
-                 return None
-             except (IndexError, AttributeError, TypeError) as e:
-                 logging.error(f"  Failed to access or process response part for {filename}. Error: {e}")
-                 try:
-                     logging.error(f"  Raw response part content (if available): {response.parts[0].text[:1000]}...")
-                 except:
-                     logging.error("  Could not retrieve raw response part content for logging.")
-                 return None
-        elif hasattr(response, 'text') and response.text: # Fallback
-             logging.info("  Attempting fallback parsing from response.text...")
-             try:
-                 json_text_response = response.text.strip().lstrip('```json').rstrip('```').strip()
-                 extracted_data = json.loads(json_text_response)
-                 # ... (rest of fallback logic as in previous script)
-                 logging.info(f"  Successfully extracted and parsed JSON from {filename} using fallback.")
-                 if "Emission Units" not in extracted_data or not isinstance(extracted_data.get("Emission Units"), list):
-                     logging.warning(f"  LLM fallback response for {filename} parsed, but 'Emission Units' key invalid. Treating as no units found.")
-                     extracted_data["Emission Units"] = []
-                 return extracted_data
-             except json.JSONDecodeError as json_e_fallback:
-                 logging.error(f"  Fallback JSON decoding failed for {filename}. Error: {json_e_fallback}")
-                 logging.error(f"  Problematic JSON text received from LLM (Fallback) for {filename}:\n--- START MALFORMED JSON ---\n{json_text_response}\n--- END MALFORMED JSON ---")
-                 return None
-             except Exception as fallback_e:
-                  logging.error(f"  Error during fallback parsing for {filename}: {fallback_e}", exc_info=True)
-                  return None
+        if response and hasattr(response, 'text'):
+            try:
+                json_text_response = response.text.strip()
+                # Try to clean up the response if it contains markdown code blocks
+                if '```json' in json_text_response:
+                    json_text_response = json_text_response.split('```json')[1].split('```')[0].strip()
+                elif '```' in json_text_response:
+                    json_text_response = json_text_response.split('```')[1].split('```')[0].strip()
+                
+                extracted_data = json.loads(json_text_response)
+                logging.info(f"  Successfully extracted and parsed JSON from {filename}.")
+                
+                if "Emission Units" not in extracted_data or not isinstance(extracted_data.get("Emission Units"), list):
+                    logging.warning(f"  LLM response for {filename} parsed, but 'Emission Units' key is missing or not a list. Treating as no units found.")
+                    extracted_data["Emission Units"] = []
+                return extracted_data
+            except json.JSONDecodeError as json_e:
+                logging.error(f"  Failed to decode JSON from response for {filename}. Error: {json_e}")
+                logging.error(f"  Raw response text:\n{json_text_response[:1000]}...")
+                return None
+            except Exception as e:
+                logging.error(f"  Error processing response for {filename}: {e}", exc_info=True)
+                return None
         else:
-             raw_response_content = str(response)
-             logging.error(f"  LLM response was empty or malformed for {filename}.")
-             logging.debug(f"  Raw Response object (stringified): {raw_response_content[:1000]}...")
-             return None
+            logging.error(f"  LLM response was empty or malformed for {filename}.")
+            if response:
+                logging.error(f"  Response object type: {type(response)}")
+                logging.error(f"  Response attributes: {dir(response)}")
+            return None
     except Exception as e:
         logging.error(f"  Error during LLM API call for {filename}: {e}", exc_info=True)
         if "API key not valid" in str(e):
-             logging.error("  Hint: Double-check your GOOGLE_API_KEY setting.")
+            logging.error("  Hint: Double-check your GOOGLE_API_KEY setting.")
         return None
 
 
