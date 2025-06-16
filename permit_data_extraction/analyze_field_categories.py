@@ -16,7 +16,7 @@ FIELD_CATEGORIES = {
         'description': 'Physical and operational characteristics of the facility'
     },
     'facility_operations': {
-        'keywords': ['hours', 'operation', 'operating', 'schedule', 'time', 'capacity', 'occupancy', 'employee', 'staff', 'worker'],
+        'keywords': ['hours', 'operation', 'operating', 'schedule', 'time', 'capacity', 'occupancy', 'employee', 'staff', 'worker', 'production'],
         'description': 'Operational details of the facility'
     },
     'contact_information': {

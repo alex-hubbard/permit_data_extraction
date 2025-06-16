@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time  # To add delays between API calls if needed
+import re
 
 import google.generativeai as genai
 import pandas as pd
@@ -28,7 +29,7 @@ GENERAL_TARGET_FIELDS = [
     "Facility Name",
     "Facility Address",
     "Facility City",
-    "Facility State",
+    "Facility State Abbreviation",
     "Facility Zip Code",
     "Facility County",
     "NAICS Code",
@@ -47,11 +48,13 @@ UNIT_DETAIL_FIELDS = [
     "Unit Description",
     "Unit Make",
     "Unit Model",
+    "Year of Manufacture",
     "Unit Type", # especially for boilers, furnaces, etc.
     "Pollutants",  # Could be a list or comma-separated string
     "Emission Limits",  # Could be complex; aim for text description for now
     "Control Device(s)",
-    "Capacity",  # e.g., MMBtu/hr, tons/year
+    "Capacity Value",  # e.g., MMBtu/hr, tons/year
+    "Capacity Unit",  # e.g., MMBtu/hr, tons/year
     "Fuel Type",  # e.g., Natural Gas, Coal, etc.
     "Rated Efficiency", # e.g., 90%
 ]
@@ -220,7 +223,31 @@ def extract_info_with_llm(model, text_content, filename):
                 elif '```' in json_text_response:
                     json_text_response = json_text_response.split('```')[1].split('```')[0].strip()
                 
-                extracted_data = json.loads(json_text_response)
+                # Clean up common JSON formatting issues
+                json_text_response = json_text_response.replace("'", '"')  # Replace single quotes with double quotes
+                json_text_response = re.sub(r'([{,]\s*)(\w+)(\s*:)', r'\1"\2"\3', json_text_response)  # Quote unquoted property names
+                json_text_response = re.sub(r'(\w+)(\s*:)(\s*)(\w+)(\s*[,}])', r'\1\2\3"\4"\5', json_text_response)  # Quote unquoted string values
+                
+                # Remove any trailing commas before closing brackets/braces
+                json_text_response = re.sub(r',(\s*[}\]])', r'\1', json_text_response)
+                
+                try:
+                    extracted_data = json.loads(json_text_response)
+                except json.JSONDecodeError as json_e:
+                    logging.error(f"  Failed to decode JSON after cleaning for {filename}. Error: {json_e}")
+                    logging.error(f"  Attempting to fix common JSON issues...")
+                    
+                    # Additional cleaning attempts
+                    json_text_response = re.sub(r'(\w+)(\s*:)(\s*)([^",\s][^,}]*?)(\s*[,}])', r'\1\2\3"\4"\5', json_text_response)  # Quote unquoted values
+                    json_text_response = re.sub(r'(\w+)(\s*:)(\s*)([^",\s][^,}]*?)(\s*[,}])', r'\1\2\3"\4"\5', json_text_response)  # Second pass for nested cases
+                    
+                    try:
+                        extracted_data = json.loads(json_text_response)
+                    except json.JSONDecodeError as json_e2:
+                        logging.error(f"  Failed to decode JSON after second cleaning attempt for {filename}. Error: {json_e2}")
+                        logging.error(f"  Raw response text:\n{json_text_response[:1000]}...")
+                        return None
+                
                 logging.info(f"  Successfully extracted and parsed JSON from {filename}.")
                 
                 if "Emission Units" not in extracted_data or not isinstance(extracted_data.get("Emission Units"), list):
