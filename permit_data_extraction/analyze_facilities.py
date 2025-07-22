@@ -19,7 +19,8 @@ def create_naics_pie_chart():
     valid_naics = df[
         (df['NAICS_CODE'].str.len() >= 5) &  # Must be 5 or 6 digits
         (df['NAICS_CODE'] != '999999') &     # Exclude 999999
-        (df['NAICS_CODE'].str.isdigit())     # Must be numeric
+        (df['NAICS_CODE'].str.isdigit()) &   # Must be numeric
+        (~df['NAICS_CODE'].str.startswith('0'))  # Exclude codes starting with 0
     ]
     
     # Extract first 2 digits and count facilities
@@ -48,8 +49,8 @@ def create_naics_pie_chart():
     
     # Create the pie chart
     plt.figure(figsize=(15, 10))
-    plt.pie(sorted_data.values, labels=labels, autopct='')  # Remove default autopct since we added it to labels
-    plt.title('Distribution of Facilities by NAICS Code Group (Top 20 + Other)\nFirst 2 digits of NAICS code (5-6 digit codes)')
+    plt.pie(sorted_data.values, labels=labels, autopct='', colors=sns.color_palette("deep", len(sorted_data)))  # Remove default autopct since we added it to labels
+    plt.title('Distribution of Facilities by NAICS Code Group (Top 20 + Other)')
     
     # Save the plot
     output_path = Path("reports/figures/naics_distribution.png")

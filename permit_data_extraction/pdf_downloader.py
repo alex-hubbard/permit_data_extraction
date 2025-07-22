@@ -6,6 +6,7 @@ import time
 import mimetypes
 import re
 import json
+import pandas as pd
 from typing import List, Tuple, Optional
 
 from permit_data_extraction.config import RAW_DATA_DIR
@@ -248,44 +249,32 @@ def download_pdf_from_page(url, output_dir, visited_urls, depth=0, max_depth=2, 
         output_dir (str): Directory where PDFs will be saved
         visited_urls (set): Set of URLs already visited to avoid duplicates
         depth (int): Current recursion depth
-        max_depth (int): Maximum recursion depth for following links
-        use_llm (bool): Whether to use Gemini for link evaluation
+        max_depth (int): Maximum depth to follow permit-related links
+        use_llm (bool): Whether to use Gemini for enhanced link identification
     
     Returns:
-        int: Number of PDFs downloaded from this page
+        int: Number of PDFs downloaded from this page and its sub-pages
     """
-    # Avoid visiting the same URL multiple times
     if url in visited_urls:
         return 0
     
     visited_urls.add(url)
     downloaded_count = 0
     
+    print(f"{'  ' * depth}Processing: {url}")
+    
     try:
-        print(f"{'  ' * depth}Scanning: {url}")
-        
-        # Send GET request to the URL
+        # Get the page content
         response = requests.get(url, timeout=30)
         response.raise_for_status()
         
-        # Parse the HTML content
-        soup = BeautifulSoup(response.text, 'html.parser')
+        # Parse the HTML
+        soup = BeautifulSoup(response.content, 'html.parser')
         
-        # Remove navigation, header, footer, sidebar, and side navigation elements to focus on main content
+        # Remove navigation elements that might contain irrelevant links
         navigation_selectors = [
-            'nav', 'header', 'footer', 'aside',
-            '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]', '[role="complementary"]',
-            '.nav', '.navigation', '.navbar', '.menu', '.sidebar', '.header', '.footer',
-            '#nav', '#navigation', '#navbar', '#menu', '#sidebar', '#header', '#footer',
-            '.site-header', '.site-footer', '.main-nav', '.primary-nav', '.secondary-nav',
-            '.breadcrumb', '.pagination', '.social-media', '.social-links',
-            '.widget', '.widgets', '.utility-nav', '.skip-nav',
-            # Additional side navigation selectors
-            '.side-nav', '.sidenav', '.side-navigation', '.left-nav', '.right-nav',
-            '.left-sidebar', '.right-sidebar', '.secondary-sidebar', '.tertiary-sidebar',
-            '#side-nav', '#sidenav', '#side-navigation', '#left-nav', '#right-nav',
-            '#left-sidebar', '#right-sidebar', '#secondary-sidebar', '#tertiary-sidebar',
-            '.sidebar-left', '.sidebar-right', '.sidebar-secondary', '.sidebar-primary',
+            'nav', '.nav', '.navigation', '.menu', '.navbar',
+            '.header', '.footer', '.sidebar', '.breadcrumb',
             '.panel-sidebar', '.rail', '.left-rail', '.right-rail',
             '.quick-links', '.related-links', '.see-also', '.in-this-section'
         ]
@@ -464,24 +453,158 @@ def download_pdf(url, output_dir=f'{RAW_DATA_DIR}/downloaded_pdfs', max_depth=2,
     print("-" * 50)
     print(f"Download complete! Downloaded {total_downloaded} PDF files to {output_dir}")
     print(f"Visited {len(visited_urls)} unique URLs")
+    
+    return total_downloaded
+
+def download_pdfs_from_csv(csv_path, output_dir=f'{RAW_DATA_DIR}/downloaded_pdfs', max_depth=2, use_llm=True, url_column='url'):
+    """
+    Download PDFs from multiple URLs specified in a CSV file.
+    
+    Args:
+        csv_path (str): Path to the CSV file containing URLs
+        output_dir (str): Directory where PDFs will be saved
+        max_depth (int): Maximum depth to follow permit-related links
+        use_llm (bool): Whether to use Gemini for enhanced link identification
+        url_column (str): Name of the column containing URLs in the CSV
+    
+    Returns:
+        dict: Summary of downloads for each URL
+    """
+    try:
+        # Read the CSV file
+        df = pd.read_csv(csv_path)
+        
+        if url_column not in df.columns:
+            print(f"Error: Column '{url_column}' not found in CSV. Available columns: {list(df.columns)}")
+            return {}
+        
+        # Get unique URLs (remove duplicates)
+        urls = df[url_column].dropna().unique()
+        
+        print(f"Found {len(urls)} unique URLs in CSV file: {csv_path}")
+        print(f"URL column: '{url_column}'")
+        print("-" * 50)
+        
+        # Create output directory if it doesn't exist
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        # Process each URL
+        results = {}
+        total_downloaded = 0
+        
+        for i, url in enumerate(urls, 1):
+            print(f"\nProcessing URL {i}/{len(urls)}: {url}")
+            print("=" * 60)
+            
+            # Create a subdirectory for each URL to organize downloads
+            url_clean = re.sub(r'[<>:"/\\|?*]', '', url.replace('://', '_').replace('/', '_'))
+            url_output_dir = os.path.join(output_dir, url_clean)
+            
+            try:
+                downloaded_count = download_pdf(url, url_output_dir, max_depth, use_llm)
+                results[url] = {
+                    'status': 'success',
+                    'downloaded': downloaded_count,
+                    'output_dir': url_output_dir
+                }
+                total_downloaded += downloaded_count
+                
+            except Exception as e:
+                print(f"Error processing {url}: {str(e)}")
+                results[url] = {
+                    'status': 'error',
+                    'error': str(e),
+                    'downloaded': 0,
+                    'output_dir': url_output_dir
+                }
+            
+            # Add delay between different websites to be respectful
+            if i < len(urls):
+                print(f"\nWaiting 5 seconds before processing next URL...")
+                time.sleep(5)
+        
+        # Print summary
+        print("\n" + "=" * 60)
+        print("BATCH DOWNLOAD SUMMARY")
+        print("=" * 60)
+        print(f"Total URLs processed: {len(urls)}")
+        print(f"Total PDFs downloaded: {total_downloaded}")
+        print(f"Output directory: {output_dir}")
+        
+        successful = sum(1 for r in results.values() if r['status'] == 'success')
+        failed = len(results) - successful
+        
+        print(f"Successful downloads: {successful}")
+        print(f"Failed downloads: {failed}")
+        
+        if failed > 0:
+            print("\nFailed URLs:")
+            for url, result in results.items():
+                if result['status'] == 'error':
+                    print(f"  - {url}: {result['error']}")
+        
+        return results
+        
+    except Exception as e:
+        print(f"Error reading CSV file {csv_path}: {str(e)}")
+        return {}
 
 if __name__ == "__main__":
-    # Example usage
-    website_url = input("Enter the website URL to download PDFs from: ")
+    # Ask user for input method
+    print("PDF Downloader - Choose input method:")
+    print("1. Single URL")
+    print("2. CSV file with URLs")
     
-    # Ask user for maximum depth
-    try:
-        max_depth = int(input("Enter maximum link depth to follow (0=no following, 1=one level, 2=two levels, etc.): ") or "2")
-    except ValueError:
-        max_depth = 2
-        print("Invalid input, using default depth of 2")
+    choice = input("Enter your choice (1 or 2): ").strip()
     
-    # Ask user about Gemini usage
-    if LLM_ENABLED:
-        use_llm_input = input("Use Gemini to identify facility-specific permits? (y/n, default=y): ").lower()
-        use_llm = use_llm_input != 'n'
+    if choice == "2":
+        # CSV file input
+        csv_path = input("Enter the path to your CSV file: ").strip()
+        if not csv_path:
+            print("No CSV path provided. Exiting.")
+            exit()
+        
+        # Ask for URL column name
+        url_column = input("Enter the name of the column containing URLs (default: 'url'): ").strip()
+        if not url_column:
+            url_column = 'url'
+        
+        # Ask user for maximum depth
+        try:
+            max_depth = int(input("Enter maximum link depth to follow (0=no following, 1=one level, 2=two levels, etc.): ") or "2")
+        except ValueError:
+            max_depth = 2
+            print("Invalid input, using default depth of 2")
+        
+        # Ask user about Gemini usage
+        if LLM_ENABLED:
+            use_llm_input = input("Use Gemini to identify facility-specific permits? (y/n, default=y): ").lower()
+            use_llm = use_llm_input != 'n'
+        else:
+            print("Gemini not available (set API_KEY environment variable to enable)")
+            use_llm = False
+        
+        # Process CSV file
+        download_pdfs_from_csv(csv_path, max_depth=max_depth, use_llm=use_llm, url_column=url_column)
+        
     else:
-        print("Gemini not available (set API_KEY environment variable to enable)")
-        use_llm = False
-    
-    download_pdf(website_url, max_depth=max_depth, use_llm=use_llm) 
+        # Single URL input (original functionality)
+        website_url = input("Enter the website URL to download PDFs from: ")
+        
+        # Ask user for maximum depth
+        try:
+            max_depth = int(input("Enter maximum link depth to follow (0=no following, 1=one level, 2=two levels, etc.): ") or "2")
+        except ValueError:
+            max_depth = 2
+            print("Invalid input, using default depth of 2")
+        
+        # Ask user about Gemini usage
+        if LLM_ENABLED:
+            use_llm_input = input("Use Gemini to identify facility-specific permits? (y/n, default=y): ").lower()
+            use_llm = use_llm_input != 'n'
+        else:
+            print("Gemini not available (set API_KEY environment variable to enable)")
+            use_llm = False
+        
+        download_pdf(website_url, max_depth=max_depth, use_llm=use_llm) 

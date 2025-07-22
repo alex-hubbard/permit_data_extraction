@@ -4,35 +4,21 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from permit_data_extraction.config import EXTERNAL_DATA_DIR
 
-def create_facilities_map():
+def create_air_facilities_map():
     # Read the data files
     facilities_path = Path(f"{EXTERNAL_DATA_DIR}/FRS_FACILITIES.csv")
-    naics_path = Path(f"{EXTERNAL_DATA_DIR}/FRS_NAICS_CODES.csv")
     program_links_path = Path(f"{EXTERNAL_DATA_DIR}/FRS_PROGRAM_LINKS.csv")
     
     df_facilities = pd.read_csv(facilities_path)
-    df_naics = pd.read_csv(naics_path)
     df_program_links = pd.read_csv(program_links_path)
-    
-    # Filter for manufacturing NAICS codes (31, 32, 33)
-    manufacturing_naics = df_naics.copy()  
-    # [
-    #     df_naics['NAICS_CODE'].astype(str).str.startswith(('31', '32', '33'))
-    # ]
-    
-    # Get the facility IDs for manufacturing facilities
-    manufacturing_facility_ids = manufacturing_naics['REGISTRY_ID'].unique()
     
     # Filter for facilities in AIR programs
     air_facilities = df_program_links[
         df_program_links['PGM_SYS_ACRNM'] == 'AIR'
     ]['REGISTRY_ID'].unique()
     
-    # Filter facilities to only those in manufacturing and AIR programs
-    df = df_facilities[
-        df_facilities['REGISTRY_ID'].isin(manufacturing_facility_ids) &
-        df_facilities['REGISTRY_ID'].isin(air_facilities)
-    ]
+    # Filter facilities to only those in AIR programs
+    df = df_facilities[df_facilities['REGISTRY_ID'].isin(air_facilities)]
     
     # Read US states shapefile
     states = gpd.read_file(f"{EXTERNAL_DATA_DIR}/us_states/us_states.shp")
@@ -99,10 +85,10 @@ def create_facilities_map():
     ax.set_axis_off()
     
     # Save the map
-    output_path = Path("reports/figures/facilities_map_all_air.png")
+    output_path = Path("reports/figures/air_facilities_map.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
 
 if __name__ == "__main__":
-    create_facilities_map() 
+    create_air_facilities_map() 
