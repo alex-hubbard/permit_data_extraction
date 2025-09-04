@@ -1,6 +1,6 @@
 # How to Use the Permit Data Extraction Testing Framework
 
-## 🎯 **Quick Start Guide**
+## **Quick Start Guide**
 
 Your testing framework is focused on **extraction accuracy testing** - ensuring your models extract data correctly and don't hallucinate. Here are all the ways to run it:
 
@@ -41,39 +41,39 @@ python -m pytest tests/test_model_comparison.py -v
 python -m pytest tests/test_data_validation.py::TestDataValidator::test_validate_required_field_present -v
 ```
 
-## 📊 **What Each Mode Does**
+## **What Each Mode Does**
 
 ### **Demo Mode** (`--demo`)
-- ✅ Shows extraction accuracy testing in action
-- ✅ Demonstrates validation, accuracy checking, and hallucination detection
-- ✅ Uses sample permit data for realistic testing
-- ✅ **No dependencies required**
+- Shows extraction accuracy testing in action
+- Demonstrates validation, accuracy checking, and hallucination detection
+- Uses sample permit data for realistic testing
+- **No dependencies required**
 
 ### **Standalone Mode** (`--mode standalone`)
-- ✅ Runs unit tests for data validation and accuracy checking
-- ✅ Runs integration tests with sample permit data
-- ✅ Provides comprehensive test results and scoring
-- ✅ **No external model dependencies required**
-- ✅ **Recommended for most use cases**
+- Runs unit tests for data validation and accuracy checking
+- Runs integration tests with sample permit data
+- Provides comprehensive test results and scoring
+- **No external model dependencies required**
+- **Recommended for most use cases**
 
 ### **Full Mode** (`--mode full`)
-- ✅ Runs all tests including model comparison
-- ✅ Tests GPT-4 vs Gemini extraction accuracy
-- ✅ Requires: `google-generativeai`, `openai`, etc.
-- ⚠️ **Use only when you have all dependencies installed**
+- Runs all tests including model comparison
+- Tests GPT-4 vs Gemini extraction accuracy
+- Requires: `google-generativeai`, `openai`, etc.
+- **Use only when you have all dependencies installed**
 
-## 🎯 **Current Performance**
+## **Current Performance**
 
 Based on the latest test run:
 
 - **Overall Score**: 80.00% (very good!)
 - **Tests Passed**: 10/15 (core functionality working)
-- **Data Validation**: ✅ 100% pass rate
-- **Accuracy Checking**: ✅ 71.43% accuracy (realistic with some errors)
-- **Hallucination Detection**: ✅ Working
-- **Extraction Testing**: ✅ Focused on real permit data
+- **Data Validation**: 100% pass rate
+- **Accuracy Checking**: 71.43% accuracy (realistic with some errors)
+- **Hallucination Detection**: Working
+- **Extraction Testing**: Focused on real permit data
 
-## 🚀 **Recommended Workflow**
+## **Recommended Workflow**
 
 ### **Step 1: Start with Demo**
 ```bash
@@ -129,38 +129,38 @@ python run_tests.py --mode standalone --test data_validation
 python run_tests.py --mode standalone --test data_generation
 ```
 
-## 🎯 **Key Features Demonstrated**
+## **Key Features Demonstrated**
 
 ### **1. Extraction Accuracy Testing**
 - Tests how accurately models extract data from permit documents
 - Compares extracted data with known ground truth
 - Identifies specific fields where extraction fails
-- **71.43% accuracy in current tests (realistic with some errors)**
+- 71.43% accuracy in current tests (realistic with some errors)
 
 ### **2. Data Validation**
 - Validates extracted data against defined rules
 - Checks data types, formats, and patterns
 - Ensures required fields are present
-- **100% pass rate in current tests**
+- 100% pass rate in current tests
 
 ### **3. Accuracy Checking**
 - Compares extracted data with ground truth
 - Calculates field-level accuracy metrics
 - Handles exact matches, partial matches, and missing fields
-- **Realistic accuracy testing with sample permit data**
+- Realistic accuracy testing with sample permit data
 
 ### **4. Hallucination Detection**
 - Detects when models generate non-existent data
 - Identifies suspicious patterns and unrealistic values
 - Provides risk confidence scores
-- **Successfully detecting low-risk scenarios**
+- Successfully detecting low-risk scenarios
 
 ### **5. Model Performance Evaluation**
 - Tests extraction accuracy with real permit data
 - Provides detailed accuracy metrics and recommendations
 - Focuses on practical extraction scenarios
 
-## 💡 **Best Practices**
+## **Best Practices**
 
 ### **For Development**
 1. **Start with demo** to understand capabilities

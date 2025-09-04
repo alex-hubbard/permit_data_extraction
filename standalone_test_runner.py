@@ -28,7 +28,7 @@ class StandaloneTestRunner:
     
     def run_all_tests(self, num_test_permits: int = 5, verbose: bool = False) -> Dict[str, Any]:
         """Run all available tests."""
-        print("🚀 Starting Permit Data Extraction Test Suite (Standalone)")
+        print("Starting Permit Data Extraction Test Suite (Standalone)")
         print("=" * 60)
         
         results = {
@@ -44,12 +44,12 @@ class StandaloneTestRunner:
         }
         
         # Run unit tests
-        print("\n📋 Running Unit Tests...")
+        print("\nRunning Unit Tests...")
         unit_test_results = self._run_unit_tests(verbose)
         results["unit_tests"] = unit_test_results
         
         # Run integration tests
-        print("\n🔗 Running Integration Tests...")
+        print("\nRunning Integration Tests...")
         integration_results = self._run_standalone_integration_tests(num_test_permits)
         results["integration_tests"] = integration_results
         
@@ -486,7 +486,7 @@ class StandaloneTestRunner:
         with open(latest_summary, 'w') as f:
             json.dump(results["overall_summary"], f, indent=2)
         
-        print(f"\n💾 Results saved to:")
+        print(f"\nResults saved to:")
         print(f"   - {results_file}")
         print(f"   - {summary_file}")
         print(f"   - {latest_results}")
@@ -497,12 +497,11 @@ class StandaloneTestRunner:
         summary = results["overall_summary"]
         
         print("\n" + "=" * 60)
-        print("📊 TEST SUITE SUMMARY")
+        print("TEST SUITE SUMMARY")
         print("=" * 60)
         
         # Status
-        status_emoji = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌"}
-        print(f"Status: {status_emoji.get(summary['status'], '❓')} {summary['status']}")
+        print(f"Status: {summary['status']}")
         
         # Test counts
         print(f"Total Tests: {summary['total_tests_run']}")
@@ -514,7 +513,7 @@ class StandaloneTestRunner:
         
         # Recommendations
         if summary["recommendations"]:
-            print(f"\n💡 Recommendations:")
+            print(f"\nRecommendations:")
             for i, rec in enumerate(summary["recommendations"], 1):
                 print(f"   {i}. {rec}")
         

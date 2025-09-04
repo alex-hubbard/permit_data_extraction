@@ -18,7 +18,7 @@ from tests.test_data_validation import DataValidator, AccuracyChecker, Hallucina
 
 def demo_extraction_accuracy():
     """Demonstrate extraction accuracy testing with sample data."""
-    print("🎯 DEMO: Extraction Accuracy Testing")
+    print("DEMO: Extraction Accuracy Testing")
     print("=" * 50)
     
     # Create sample permit data (ground truth)
@@ -72,7 +72,7 @@ def demo_extraction_accuracy():
 
 def demo_data_validation():
     """Demonstrate data validation."""
-    print("\n🔍 DEMO: Data Validation")
+    print("\nDEMO: Data Validation")
     print("=" * 50)
     
     # Use sample permit data
@@ -124,7 +124,7 @@ def demo_data_validation():
 
 def demo_accuracy_checking():
     """Demonstrate accuracy checking."""
-    print("\n📊 DEMO: Accuracy Checking")
+    print("\nDEMO: Accuracy Checking")
     print("=" * 50)
     
     # Use the sample data from extraction accuracy demo
@@ -143,7 +143,7 @@ def demo_accuracy_checking():
 
 def demo_hallucination_detection():
     """Demonstrate hallucination detection."""
-    print("\n🚫 DEMO: Hallucination Detection")
+    print("\nDEMO: Hallucination Detection")
     print("=" * 50)
     
     # Use sample permit data
@@ -180,33 +180,33 @@ def demo_hallucination_detection():
 
 def demo_extraction_testing():
     """Demonstrate extraction testing capabilities."""
-    print("\n📋 DEMO: Extraction Testing Capabilities")
+    print("\nDEMO: Extraction Testing Capabilities")
     print("=" * 50)
     
     # Show what the framework can test
     print("The testing framework can validate:")
-    print("  ✅ Data extraction accuracy")
-    print("  ✅ Field-level validation")
-    print("  ✅ Hallucination detection")
-    print("  ✅ Model comparison")
-    print("  ✅ Error detection and reporting")
+    print("  - Data extraction accuracy")
+    print("  - Field-level validation")
+    print("  - Hallucination detection")
+    print("  - Model comparison")
+    print("  - Error detection and reporting")
     
     print("\nSample test scenarios:")
-    print("  📊 Perfect extraction: 100% accuracy")
-    print("  📊 Partial extraction: 90% accuracy (some fields missing/modified)")
-    print("  📊 Poor extraction: <70% accuracy (many errors)")
-    print("  🚫 Hallucination: Model generates non-existent data")
+    print("  - Perfect extraction: 100% accuracy")
+    print("  - Partial extraction: 90% accuracy (some fields missing/modified)")
+    print("  - Poor extraction: <70% accuracy (many errors)")
+    print("  - Hallucination: Model generates non-existent data")
     
     print("\nValidation rules tested:")
-    print("  🔍 Required fields present")
-    print("  🔍 Data types correct")
-    print("  🔍 Format patterns valid")
-    print("  🔍 Field lengths appropriate")
+    print("  - Required fields present")
+    print("  - Data types correct")
+    print("  - Format patterns valid")
+    print("  - Field lengths appropriate")
 
 
 def main():
     """Run all demonstrations."""
-    print("🧪 PERMIT DATA EXTRACTION TESTING FRAMEWORK DEMO")
+    print("PERMIT DATA EXTRACTION TESTING FRAMEWORK DEMO")
     print("=" * 60)
     print("This demo shows the key features of the testing framework:")
     print("- Extraction accuracy testing")
@@ -224,16 +224,16 @@ def main():
         demo_extraction_testing()
         
         print("\n" + "=" * 60)
-        print("✅ All demonstrations completed successfully!")
+        print("All demonstrations completed successfully!")
         print("=" * 60)
         
-        print("\n💡 Next Steps:")
+        print("\nNext Steps:")
         print("1. Install the full permit data extraction dependencies")
         print("2. Run the complete test suite: python tests/test_runner.py --test all")
         print("3. Integrate testing into your development workflow")
         
     except Exception as e:
-        print(f"\n❌ Demo failed: {e}")
+        print(f"\nDemo failed: {e}")
         import traceback
         traceback.print_exc()
         return 1
