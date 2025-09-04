@@ -1,5 +1,9 @@
 # Data
 /data/
+/reports
+
+# Test results
+/test_results/
 
 # Mac OS-specific storage files
 .DS_Store
@@ -185,3 +189,4 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 presentation_outline.md
+reports/figures/facilities_map_all_air.png

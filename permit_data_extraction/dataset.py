@@ -3,8 +3,9 @@ import logging
 import os
 import time  # To add delays between API calls if needed
 import re
+import shutil
 
-import google.generativeai as genai
+import openai
 import pandas as pd
 import PyPDF2  # Library for reading text from PDFs
 import typer
@@ -16,9 +17,11 @@ from permit_data_extraction.config import RAW_DATA_DIR, INTERIM_DATA_DIR, PROCES
 
 app = typer.Typer()
 
-API_KEY = dotenv_values()['API_KEY']
+OPENAI_API_KEY = dotenv_values()['CBORG_API_KEY']
 
 TEXT_INPUT_DIR = INTERIM_DATA_DIR / 'extracted_text'
+COMPLETED_DIR = TEXT_INPUT_DIR / 'completed'
+FAILED_DIR = TEXT_INPUT_DIR / 'failed'
 
 # Path for the output Excel file
 OUTPUT_EXCEL_FILE = os.path.join(PROCESSED_DATA_DIR,
@@ -126,17 +129,62 @@ Analyze the following text from an industrial air permit document. Your goal is 
 """
 
 
-def configure_llm():
-    """Configures the Google Generative AI client."""
+def setup_directories():
+    """Creates the completed and failed directories if they don't exist."""
+    COMPLETED_DIR.mkdir(parents=True, exist_ok=True)
+    FAILED_DIR.mkdir(parents=True, exist_ok=True)
+    logging.info(f"Completed directory ready at: {COMPLETED_DIR}")
+    logging.info(f"Failed directory ready at: {FAILED_DIR}")
+
+
+def move_processed_file(file_path, success=True):
+    """Move a processed file to the appropriate folder (completed or failed)."""
     try:
-        genai.configure(api_key=API_KEY)
-        # Choose the Gemini model - check availability and suitability
-        model = genai.GenerativeModel('gemini-2.0-flash')  # Can switch model
-        print("Google Generative AI configured successfully.")
-        return model
+        # Choose destination directory based on success
+        if success:
+            destination_dir = COMPLETED_DIR
+            folder_name = "completed"
+        else:
+            destination_dir = FAILED_DIR
+            folder_name = "failed"
+        
+        # Create destination directory if it doesn't exist
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create destination path
+        destination = destination_dir / file_path.name
+        
+        # If file already exists in destination, add a timestamp
+        if destination.exists():
+            timestamp = int(time.time())
+            stem = file_path.stem
+            suffix = file_path.suffix
+            destination = destination_dir / f"{stem}_{timestamp}{suffix}"
+        
+        # Move the file
+        shutil.move(str(file_path), str(destination))
+        
+        status = "successfully processed" if success else "failed processing"
+        logging.info(f"  Moved {file_path.name} to {folder_name} folder ({status})")
+        print(f"  → Moved to {folder_name} folder")
+        
     except Exception as e:
-        print(f"Error configuring Google Generative AI: {e}")
-        print("Please ensure your API key is correct and valid.")
+        logging.error(f"  Failed to move {file_path.name} to {folder_name} folder: {e}")
+        print(f"  → Warning: Could not move file to {folder_name} folder")
+
+
+def configure_llm():
+    """Configures the OpenAI client."""
+    try:
+        client = openai.OpenAI(api_key=OPENAI_API_KEY,
+                               base_url="https://api.cborg.lbl.gov")
+        # Test the connection with a simple call
+        client.models.list()
+        print("OpenAI client configured successfully.")
+        return client
+    except Exception as e:
+        print(f"Error configuring OpenAI client: {e}")
+        print("Please ensure your OpenAI API key is correct and valid.")
         return None
 
 
@@ -176,10 +224,10 @@ def read_text_from_file(file_path):
         return None
 
 
-def extract_info_with_llm(model, text_content, filename):
+def extract_info_with_llm(client, text_content, filename):
     """Sends text to the LLM and attempts to parse the JSON response."""
-    if not model or not text_content:
-        logging.warning(f"  Skipping LLM call for {filename} due to missing model or text.")
+    if not client or not text_content:
+        logging.warning(f"  Skipping LLM call for {filename} due to missing client or text.")
         return None
 
     try:
@@ -188,65 +236,44 @@ def extract_info_with_llm(model, text_content, filename):
         logging.error(f"  Internal Error: An unexpected error occurred during prompt formatting: {format_e}", exc_info=True)
         return None
 
-    safety_settings = [
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-    ]
-    generation_config = {
-        "temperature": 0.1,
-        "top_p": 1.0,
-        "top_k": 1,
-        "max_output_tokens": 8192,
-    }
-
     logging.info(f"  Sending text from {filename} to LLM (approx {len(text_content)} chars)...")
     try:
-        time.sleep(1.5) # API call delay
-
-        response = model.generate_content(
-            prompt,
-            generation_config=generation_config,
-            safety_settings=safety_settings
-            )
-
+        time.sleep(1.0)  # API call delay
+        
+        logging.info(f"  Making API call for {filename}...")
+        response = client.chat.completions.create(
+            model="openai/gpt-4.1",  # Using GPT-4 for better JSON parsing
+            messages=[
+                {"role": "system", "content": "You are an expert at extracting structured information from industrial air permit documents. Always respond with valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            max_tokens=8192,
+            timeout=60,  # 60 second timeout
+            response_format={"type": "json_object"}  # Ensures JSON response
+        )
+        
+        logging.info(f"  API call completed for {filename}")
         extracted_data = None
-        json_text_response = None # For logging in case of error
+        json_text_response = None  # For logging in case of error
 
-        if response and hasattr(response, 'text'):
+        if response and response.choices and len(response.choices) > 0:
             try:
-                json_text_response = response.text.strip()
-                # Try to clean up the response if it contains markdown code blocks
+                json_text_response = response.choices[0].message.content.strip()
+                
+                # Since we're using response_format={"type": "json_object"}, the response should already be valid JSON
+                # But we'll still clean up just in case
                 if '```json' in json_text_response:
                     json_text_response = json_text_response.split('```json')[1].split('```')[0].strip()
                 elif '```' in json_text_response:
                     json_text_response = json_text_response.split('```')[1].split('```')[0].strip()
                 
-                # Clean up common JSON formatting issues
-                json_text_response = json_text_response.replace("'", '"')  # Replace single quotes with double quotes
-                json_text_response = re.sub(r'([{,]\s*)(\w+)(\s*:)', r'\1"\2"\3', json_text_response)  # Quote unquoted property names
-                json_text_response = re.sub(r'(\w+)(\s*:)(\s*)(\w+)(\s*[,}])', r'\1\2\3"\4"\5', json_text_response)  # Quote unquoted string values
-                
-                # Remove any trailing commas before closing brackets/braces
-                json_text_response = re.sub(r',(\s*[}\]])', r'\1', json_text_response)
-                
                 try:
                     extracted_data = json.loads(json_text_response)
                 except json.JSONDecodeError as json_e:
-                    logging.error(f"  Failed to decode JSON after cleaning for {filename}. Error: {json_e}")
-                    logging.error(f"  Attempting to fix common JSON issues...")
-                    
-                    # Additional cleaning attempts
-                    json_text_response = re.sub(r'(\w+)(\s*:)(\s*)([^",\s][^,}]*?)(\s*[,}])', r'\1\2\3"\4"\5', json_text_response)  # Quote unquoted values
-                    json_text_response = re.sub(r'(\w+)(\s*:)(\s*)([^",\s][^,}]*?)(\s*[,}])', r'\1\2\3"\4"\5', json_text_response)  # Second pass for nested cases
-                    
-                    try:
-                        extracted_data = json.loads(json_text_response)
-                    except json.JSONDecodeError as json_e2:
-                        logging.error(f"  Failed to decode JSON after second cleaning attempt for {filename}. Error: {json_e2}")
-                        logging.error(f"  Raw response text:\n{json_text_response[:1000]}...")
-                        return None
+                    logging.error(f"  Failed to decode JSON for {filename}. Error: {json_e}")
+                    logging.error(f"  Raw response text:\n{json_text_response[:1000]}...")
+                    return None
                 
                 logging.info(f"  Successfully extracted and parsed JSON from {filename}.")
                 
@@ -254,10 +281,7 @@ def extract_info_with_llm(model, text_content, filename):
                     logging.warning(f"  LLM response for {filename} parsed, but 'Emission Units' key is missing or not a list. Treating as no units found.")
                     extracted_data["Emission Units"] = []
                 return extracted_data
-            except json.JSONDecodeError as json_e:
-                logging.error(f"  Failed to decode JSON from response for {filename}. Error: {json_e}")
-                logging.error(f"  Raw response text:\n{json_text_response[:1000]}...")
-                return None
+                
             except Exception as e:
                 logging.error(f"  Error processing response for {filename}: {e}", exc_info=True)
                 return None
@@ -265,44 +289,95 @@ def extract_info_with_llm(model, text_content, filename):
             logging.error(f"  LLM response was empty or malformed for {filename}.")
             if response:
                 logging.error(f"  Response object type: {type(response)}")
-                logging.error(f"  Response attributes: {dir(response)}")
+                logging.error(f"  Response choices: {response.choices if hasattr(response, 'choices') else 'No choices'}")
             return None
     except Exception as e:
         logging.error(f"  Error during LLM API call for {filename}: {e}", exc_info=True)
         if "API key not valid" in str(e):
-            logging.error("  Hint: Double-check your GOOGLE_API_KEY setting.")
+            logging.error("  Hint: Double-check your OPENAI_API_KEY setting.")
         return None
 
 
 @app.command()
 def main():
+    print("Starting LLM Extraction Process from Text Files...")
     logging.info("Starting LLM Extraction Process from Text Files...")
 
-    llm_model = configure_llm()
-    if not llm_model:
+    llm_client = configure_llm()
+    if not llm_client:
+        print("ERROR: LLM configuration failed!")
         logging.critical("Exiting due to LLM configuration error.")
         return
 
+    print(f"Checking for text files in: {TEXT_INPUT_DIR}")
     if not TEXT_INPUT_DIR.is_dir():
+        print(f"ERROR: Text input directory not found at '{TEXT_INPUT_DIR}'")
         logging.critical(f"Error: Text input directory not found at '{TEXT_INPUT_DIR}'. This directory should contain .txt files from the ocr_processor.py script.")
         return
 
-    text_files = list(TEXT_INPUT_DIR.glob('*.txt'))
+    # Setup completed and failed directories
+    setup_directories()
+
+    # Get all .txt files from the main directory (excluding completed folder)
+    all_txt_files = list(TEXT_INPUT_DIR.glob('*.txt'))
+    
+    # Get list of already processed files (both completed and failed)
+    processed_files = set()
+    
+    # Check completed files
+    if COMPLETED_DIR.exists():
+        for f in COMPLETED_DIR.glob('*.txt'):
+            processed_files.add(f.name)
+            # Also handle timestamped files (remove timestamp suffix)
+            name_parts = f.stem.split('_')
+            if len(name_parts) > 1 and name_parts[-1].isdigit():
+                original_name = '_'.join(name_parts[:-1]) + f.suffix
+                processed_files.add(original_name)
+    
+    # Check failed files
+    if FAILED_DIR.exists():
+        for f in FAILED_DIR.glob('*.txt'):
+            processed_files.add(f.name)
+            # Also handle timestamped files (remove timestamp suffix)
+            name_parts = f.stem.split('_')
+            if len(name_parts) > 1 and name_parts[-1].isdigit():
+                original_name = '_'.join(name_parts[:-1]) + f.suffix
+                processed_files.add(original_name)
+    
+    # Filter out already processed files
+    text_files = [f for f in all_txt_files if f.name not in processed_files]
+    
+    completed_count = len(list(COMPLETED_DIR.glob('*.txt'))) if COMPLETED_DIR.exists() else 0
+    failed_count = len(list(FAILED_DIR.glob('*.txt'))) if FAILED_DIR.exists() else 0
+    
+    print(f"Found {len(all_txt_files)} total .txt files")
+    print(f"  - {completed_count} previously completed successfully")
+    print(f"  - {failed_count} previously failed")
+    print(f"Processing {len(text_files)} remaining files")
     if not text_files:
+        print(f"No .txt files found in '{TEXT_INPUT_DIR}'.")
         logging.warning(f"No .txt files found in '{TEXT_INPUT_DIR}'.")
         return
 
+    print(f"Processing {len(text_files)} .txt files...")
     logging.info(f"Found {len(text_files)} .txt files to process.")
     processed_data_rows = []
 
-    for txt_file_path in text_files:
-        logging.info(f"\nProcessing text file: {txt_file_path.name}")
+    # Limit to first 3 files for testing
+    # test_files = text_files[:3]
+    logging.info(f"Processing first {len(text_files)} files for testing...")
+
+    for i, txt_file_path in enumerate(text_files, 1):
+        print(f"\nProcessing text file {i}/{len(text_files)}: {txt_file_path.name}")
+        logging.info(f"\nProcessing text file {i}/{len(text_files)}: {txt_file_path.name}")
         original_filename = txt_file_path.stem # Assumes .txt was added to original PDF stem
 
         permit_text_content = read_text_from_file(txt_file_path)
         if not permit_text_content:
             logging.warning(f"  Skipping file {original_filename} due to text reading error or empty content.")
             processed_data_rows.append({"Filename": original_filename, "Status": "Text Reading Failed", **{field: "ERROR" for field in ALL_OUTPUT_FIELDS}})
+            # Move file to failed folder - failed to read
+            move_processed_file(txt_file_path, success=False)
             continue
 
         # MAX_CHARS check can still be useful here if there's a concern about LLM input limits
@@ -311,7 +386,7 @@ def main():
             logging.warning(f"  Text from {original_filename} is very long ({len(permit_text_content)} chars). Processing may be slow/costly.")
             # permit_text_content = permit_text_content[:MAX_CHARS] # Optional truncation
 
-        extracted_info = extract_info_with_llm(llm_model, permit_text_content, original_filename)
+        extracted_info = extract_info_with_llm(llm_client, permit_text_content, original_filename)
 
         # Process results (same logic as before)
         if extracted_info and isinstance(extracted_info, dict):
@@ -338,6 +413,9 @@ def main():
                         row_data.update(general_info)
                         for field in UNIT_DETAIL_FIELDS: row_data[field] = "INVALID UNIT ENTRY"
                         processed_data_rows.append(row_data)
+                
+                # Move file to completed folder - successful extraction with units
+                move_processed_file(txt_file_path, success=True)
 
             else:
                 logging.info(f"  No valid emission units extracted or found for {original_filename}.")
@@ -346,10 +424,16 @@ def main():
                 row_data.update(general_info)
                 for field in UNIT_DETAIL_FIELDS: row_data[field] = None
                 processed_data_rows.append(row_data)
+                
+                # Move file to completed folder - successful extraction but no units
+                move_processed_file(txt_file_path, success=True)
         else:
             logging.error(f"  Failed to extract information from {original_filename} (LLM call returned None or invalid data).")
             # ... (LLM extraction failed logging as before)
             processed_data_rows.append({"Filename": original_filename, "Status": "LLM Extraction Failed", **{field: "ERROR" for field in ALL_OUTPUT_FIELDS}})
+            
+            # Move file to failed folder - failed extraction
+            move_processed_file(txt_file_path, success=False)
 
 
     # Save to Excel (same logic as before)
@@ -367,8 +451,13 @@ def main():
         except Exception as e:
             logging.error(f"Error saving data to Excel: {e}", exc_info=True)
     else:
+        print("No data was processed to save.")
         logging.warning("No data was processed to save.")
 
+    print(f"\nLLM Extraction process finished!")
+    print(f"Processed {len(text_files)} files")
+    print(f"Successful files moved to: {COMPLETED_DIR}")
+    print(f"Failed files moved to: {FAILED_DIR}")
     logging.info("\nLLM Extraction process finished.")
 
 

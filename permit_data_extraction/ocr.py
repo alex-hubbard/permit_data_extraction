@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 PDF_INPUT_DIR = Path(RAW_DATA_DIR)  # Example: Path('./raw_permits')
 
 # Directory where extracted .txt files will be saved
-TEXT_OUTPUT_DIR = Path(INTERIM_DATA_DIR)
+TEXT_OUTPUT_DIR = Path(INTERIM_DATA_DIR / 'extracted_text')
 
 # --- Tesseract Configuration ---
 TESSERACT_CMD = None

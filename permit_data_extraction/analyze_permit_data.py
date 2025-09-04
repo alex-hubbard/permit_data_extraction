@@ -49,7 +49,8 @@ def extract_fields_with_gemini(text: str) -> Dict[str, List[str]]:
     - Facility hours
     - Equipment types
     - Equipment sizes
-    - Equipment capacities
+    - Equipment capacitity values
+    - Equipment capacitity units
     - Equipment hours
     - Equipment use
     - Equipment location

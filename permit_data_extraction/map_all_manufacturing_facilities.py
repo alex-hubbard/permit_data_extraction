@@ -4,20 +4,17 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from permit_data_extraction.config import EXTERNAL_DATA_DIR
 
-def create_facilities_map():
+def create_all_manufacturing_facilities_map():
     # Read the data files
     facilities_path = Path(f"{EXTERNAL_DATA_DIR}/FRS_FACILITIES.csv")
     naics_path = Path(f"{EXTERNAL_DATA_DIR}/FRS_NAICS_CODES.csv")
-    program_links_path = Path(f"{EXTERNAL_DATA_DIR}/FRS_PROGRAM_LINKS.csv")
     
     df_facilities = pd.read_csv(facilities_path, low_memory=False)
     df_naics = pd.read_csv(naics_path, low_memory=False)
-    df_program_links = pd.read_csv(program_links_path, low_memory=False)
     
     # Convert REGISTRY_ID to string in all dataframes to ensure consistent data types
     df_facilities['REGISTRY_ID'] = df_facilities['REGISTRY_ID'].astype(str)
     df_naics['REGISTRY_ID'] = df_naics['REGISTRY_ID'].astype(str)
-    df_program_links['REGISTRY_ID'] = df_program_links['REGISTRY_ID'].astype(str)
     
     # Filter for manufacturing NAICS codes (31, 32, 33)
     manufacturing_naics = df_naics.copy()  
@@ -28,15 +25,9 @@ def create_facilities_map():
     # Get the facility IDs for manufacturing facilities
     manufacturing_facility_ids = manufacturing_naics['REGISTRY_ID'].unique()
     
-    # Filter for facilities in AIR programs
-    air_facilities = df_program_links[
-        df_program_links['PGM_SYS_ACRNM'] == 'AIR'
-    ]['REGISTRY_ID'].unique()
-    
-    # Filter facilities to only those in manufacturing and AIR programs
+    # Filter facilities to only those in manufacturing (no AIR program filter)
     df = df_facilities[
-        df_facilities['REGISTRY_ID'].isin(manufacturing_facility_ids) &
-        df_facilities['REGISTRY_ID'].isin(air_facilities)
+        df_facilities['REGISTRY_ID'].isin(manufacturing_facility_ids)
     ]
     
     # Merge NAICS codes with facilities data
@@ -95,7 +86,7 @@ def create_facilities_map():
         ax=ax,
         markersize=0.5,
         alpha=0.5,
-        color='red'
+        color='blue'
     )
     
     # Set the plot extent to match the state boundaries
@@ -103,19 +94,19 @@ def create_facilities_map():
     ax.set_ylim(bounds[1], bounds[3])
     
     # Set title and remove axis
-    plt.title(f'Air Facility Locations in the Contiguous United States\nTotal Facilities: {len(gdf):,}', fontsize=16)
+    plt.title(f'All Manufacturing Facility Locations in the Contiguous United States\nTotal Facilities: {len(gdf):,}', fontsize=16)
     ax.set_axis_off()
     
     # Save the map
-    output_path = Path("reports/figures/facilities_map_all_air.png")
+    output_path = Path("reports/figures/facilities_map_all_manufacturing.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
     
     # Save the data to CSV
-    csv_output_path = Path("reports/data/facilities_map_all_air.csv")
+    csv_output_path = Path("reports/data/facilities_map_all_manufacturing.csv")
     csv_output_path.parent.mkdir(parents=True, exist_ok=True)
     gdf.to_csv(csv_output_path, index=False)
 
 if __name__ == "__main__":
-    create_facilities_map() 
+    create_all_manufacturing_facilities_map() 
