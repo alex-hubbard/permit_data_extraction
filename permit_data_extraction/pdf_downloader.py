@@ -1,116 +1,112 @@
+import json
+import os
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Set, Tuple
+from urllib.parse import urljoin, urlparse
+
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-import os
-from urllib.parse import urljoin, urlparse
-import time
-import mimetypes
-import re
-import json
-import pandas as pd
-from typing import List, Tuple, Optional
+from loguru import logger
+from requests.adapters import HTTPAdapter
+from selenium import webdriver
+from selenium.common.exceptions import WebDriverException
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from urllib3.util.retry import Retry
 
 from permit_data_extraction.config import RAW_DATA_DIR
 
 # LLM Configuration
-LLM_API_KEY = os.getenv('API_KEY')  # Set your Google API key as environment variable
-LLM_MODEL = "gemini-2.0-flash"  # You can change this to gemini-1.5-pro for better accuracy
+LLM_API_KEY = os.getenv("API_KEY")  # Set your Google API key as environment variable
+LLM_MODEL = "gemini-2.5-flash"  # You can change this to gemini-1.5-pro for better accuracy
 LLM_ENABLED = LLM_API_KEY is not None
 
-def clean_filename(filename):
-    """
-    Clean the filename by removing invalid characters and extra spaces.
-    
-    Args:
-        filename (str): The filename to clean
-    
-    Returns:
-        str: Cleaned filename
-    """
-    # Remove invalid characters
-    filename = re.sub(r'[<>:"/\\|?*]', '', filename)
-    # Replace multiple spaces with single space
-    filename = re.sub(r'\s+', ' ', filename)
-    # Strip leading/trailing spaces
-    filename = filename.strip()
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+
+
+def _create_requests_session() -> requests.Session:
+    retry_strategy = Retry(
+        total=5,
+        backoff_factor=1.0,
+        status_forcelist=[403, 408, 429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def clean_filename(filename: str) -> str:
+    filename = re.sub(r'[<>:"/\\|?*]', "", filename)
+    filename = re.sub(r"\s+", " ", filename).strip()
     return filename
 
-def is_pdf_link(url, response=None):
-    """
-    Check if a URL points to a PDF file by checking both the URL and content type.
-    
-    Args:
-        url (str): The URL to check
-        response (requests.Response, optional): Response object if already fetched
-    
-    Returns:
-        bool: True if the URL points to a PDF, False otherwise
-    """
-    # Check URL extension
-    if url.lower().endswith('.pdf'):
-        return True
-    
-    # If we have a response, check content type
-    if response:
-        content_type = response.headers.get('content-type', '').lower()
-        if 'application/pdf' in content_type:
-            return True
-    
-    return False
 
-def is_permit_related_link_keywords(link_text, href):
-    """
-    Check if a link contains the word "permit" in the link text or URL.
-    
-    Args:
-        link_text (str): The text content of the link
-        href (str): The URL of the link
-    
-    Returns:
-        bool: True if the link contains "permit", False otherwise
-    """
-    # Convert to lowercase for case-insensitive matching
-    link_text_lower = link_text.lower()
-    href_lower = href.lower()
-    
-    # Check for "permit" (including plural "permits")
-    return 'permit' in link_text_lower or 'permit' in href_lower
+def guess_filename_from_url(url: str) -> str:
+    path = urlparse(url).path
+    filename = os.path.basename(path)
+    return filename or "document"
 
-def evaluate_links_with_llm(links_data: List[Tuple[str, str, str, bool]], page_context: str = "") -> List[Tuple[str, str, float, str, bool]]:
-    """
-    Use Gemini to evaluate which links are likely to contain permits for specific facilities.
-    
-    Args:
-        links_data: List of tuples (url, link_text, surrounding_context, is_table_link)
-        page_context: Additional context about the current page
-    
-    Returns:
-        List of tuples (url, link_text, confidence_score, facility_name, is_table_link) for likely facility-specific permit links
-    """
-    if not LLM_ENABLED:
+
+def is_probable_pdf(url: str) -> bool:
+    lower_url = url.lower()
+    return lower_url.endswith(".pdf") or "permit" in lower_url
+
+
+def is_permit_related_link_keywords(link_text: str, href: str) -> bool:
+    text = link_text.lower()
+    url = href.lower()
+    return "permit" in text or "permit" in url
+
+
+def evaluate_links_with_llm(
+    links_data: List[Tuple[str, str, str, bool]],
+    page_context: str = "",
+) -> List[Tuple[str, str, float, str, bool]]:
+    if not (LLM_ENABLED and links_data):
         return []
-    
-    if not links_data:
-        return []
-    
+
     try:
-        # Prepare the prompt
-        links_for_analysis = []
+        payload_links = []
         for i, (url, link_text, context, is_table_link) in enumerate(links_data):
-            links_for_analysis.append({
-                "id": i,
-                "url": url,
-                "link_text": link_text,
-                "context": context,
-                "in_table": is_table_link
-            })
-        
+            payload_links.append(
+                {
+                    "id": i,
+                    "url": url,
+                    "link_text": link_text,
+                    "context": context,
+                    "in_table": is_table_link,
+                }
+            )
+
         prompt = f"""
 You are analyzing links from a government or municipal website to identify which ones are likely to contain permits for SPECIFIC FACILITIES (like power plants, refineries, hospitals, manufacturing plants, etc.) rather than general permit information.
 
 Page Context: {page_context[:500]}
 
 Links to analyze:
-{json.dumps(links_for_analysis, indent=2)}
+{json.dumps(payload_links, indent=2)}
 
 For each link, determine if it's likely to lead to permits or documents for a SPECIFIC NAMED FACILITY rather than general permit information, databases, or application forms.
 
@@ -139,472 +135,727 @@ Respond with a JSON array where each object has:
 Only return the JSON array, no other text.
 """
 
-        # Call Google Gemini API
-        headers = {
-            'Content-Type': 'application/json'
-        }
-        
         data = {
-            'contents': [
-                {
-                    'parts': [
-                        {
-                            'text': prompt
-                        }
-                    ]
-                }
-            ],
-            'generationConfig': {
-                'temperature': 0.3,
-                'maxOutputTokens': 1000,
-                'candidateCount': 1
-            }
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": 1000,
+                "candidateCount": 1,
+            },
         }
-        
-        url = f'https://generativelanguage.googleapis.com/v1beta/models/{LLM_MODEL}:generateContent?key={LLM_API_KEY}'
-        
-        response = requests.post(
-            url,
-            headers=headers,
-            json=data,
-            timeout=30
+
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models"
+            f"/{LLM_MODEL}:generateContent?key={LLM_API_KEY}"
         )
-        
-        if response.status_code == 200:
-            result = response.json()
-            if 'candidates' in result and len(result['candidates']) > 0:
-                content = result['candidates'][0]['content']['parts'][0]['text'].strip()
-            else:
-                print(f"  Unexpected Gemini response format: {result}")
-                return []
-            
-            # Parse the JSON response
-            try:
-                evaluations = json.loads(content)
-                permit_links = []
-                
-                for eval_result in evaluations:
-                    if eval_result.get('likely_facility_specific', False):
-                        link_id = eval_result['id']
-                        confidence = eval_result.get('confidence', 0.5)
-                        facility_name = eval_result.get('facility_name', 'Unknown Facility')
-                        if link_id < len(links_data):
-                            url, link_text, _, is_table_link = links_data[link_id]
-                            permit_links.append((url, link_text, confidence, facility_name, is_table_link))
-                
-                return permit_links
-                
-            except json.JSONDecodeError as e:
-                print(f"  Error parsing LLM response: {e}")
-                return []
-        else:
-            print(f"  Gemini API error: {response.status_code} - {response.text}")
-            return []
-            
-    except Exception as e:
-        print(f"  Error calling Gemini: {e}")
+        response = requests.post(url, json=data, timeout=45)
+        response.raise_for_status()
+
+        result = response.json()
+        content = (
+            result["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if result.get("candidates")
+            else ""
+        )
+
+        evaluations = json.loads(content)
+        permit_links: List[Tuple[str, str, float, str, bool]] = []
+        for evaluation in evaluations:
+            if evaluation.get("likely_facility_specific"):
+                link_id = evaluation["id"]
+                if link_id < len(links_data):
+                    permit_links.append(
+                        (
+                            links_data[link_id][0],
+                            links_data[link_id][1],
+                            evaluation.get("confidence", 0.5),
+                            evaluation.get("facility_name", "Unknown Facility"),
+                            links_data[link_id][3],
+                        )
+                    )
+        return permit_links
+    except Exception as exc:
+        logger.warning(f"Gemini evaluation failed: {exc}")
         return []
 
-def get_link_context(link_element, soup):
-    """
-    Get surrounding context for a link to help Gemini evaluation.
-    
-    Args:
-        link_element: BeautifulSoup link element
-        soup: BeautifulSoup object of the page
-    
-    Returns:
-        str: Surrounding context text
-    """
+
+def get_link_context(link_element, soup: BeautifulSoup) -> str:
     context_parts = []
-    
-    # Get parent element text
+
     parent = link_element.parent
     if parent:
         parent_text = parent.get_text().strip()
         if parent_text and parent_text != link_element.get_text().strip():
             context_parts.append(parent_text[:200])
-    
-    # Get preceding and following siblings
+
     prev_sibling = link_element.previous_sibling
-    if prev_sibling and hasattr(prev_sibling, 'get_text'):
+    if prev_sibling and hasattr(prev_sibling, "get_text"):
         prev_text = prev_sibling.get_text().strip()
         if prev_text:
             context_parts.append(prev_text[-100:])
-    
+
     next_sibling = link_element.next_sibling
-    if next_sibling and hasattr(next_sibling, 'get_text'):
+    if next_sibling and hasattr(next_sibling, "get_text"):
         next_text = next_sibling.get_text().strip()
         if next_text:
             context_parts.append(next_text[:100])
-    
+
     return " | ".join(context_parts)
 
-def download_pdf_from_page(url, output_dir, visited_urls, depth=0, max_depth=2, use_llm=True):
-    """
-    Download PDF files from a given URL and optionally follow facility-specific permit links.
-    
-    Args:
-        url (str): The URL of the website to scrape for PDFs
-        output_dir (str): Directory where PDFs will be saved
-        visited_urls (set): Set of URLs already visited to avoid duplicates
-        depth (int): Current recursion depth
-        max_depth (int): Maximum depth to follow permit-related links
-        use_llm (bool): Whether to use Gemini for enhanced link identification
-    
-    Returns:
-        int: Number of PDFs downloaded from this page and its sub-pages
-    """
-    if url in visited_urls:
-        return 0
-    
-    visited_urls.add(url)
-    downloaded_count = 0
-    
-    print(f"{'  ' * depth}Processing: {url}")
-    
-    try:
-        # Get the page content
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        
-        # Parse the HTML
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Remove navigation elements that might contain irrelevant links
+
+@dataclass
+class LinkCandidate:
+    url: str
+    text: str
+    context: str
+    in_table: bool
+
+
+class SeleniumPDFDownloader:
+    def __init__(
+        self,
+        output_dir: Path,
+        headless: bool = True,
+        wait_seconds: int = 4,
+        max_depth: int = 2,
+        use_llm: bool = True,
+    ) -> None:
+        self.output_dir = Path(output_dir).expanduser()
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.temp_dir = self.output_dir / "_temp_downloads"
+        self.temp_dir.mkdir(exist_ok=True)
+
+        self.headless = headless
+        self.wait_seconds = wait_seconds
+        self.max_depth = max_depth
+        self.use_llm = use_llm and LLM_ENABLED
+
+        self.visited_urls: Set[str] = set()
+        self.session = _create_requests_session()
+        self.driver = self._setup_driver()
+
+    def _setup_driver(self) -> webdriver.Chrome:
+        chrome_options = Options()
+        if self.headless:
+            chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1920,1080")
+
+        prefs = {
+            "download.default_directory": str(self.temp_dir.resolve()),
+            "download.prompt_for_download": False,
+            "download.directory_upgrade": True,
+            "safebrowsing.enabled": False,
+            "safebrowsing.disable_download_protection": True,
+            "plugins.always_open_pdf_externally": True,
+        }
+        chrome_options.add_experimental_option("prefs", prefs)
+
+        try:
+            driver = webdriver.Chrome(options=chrome_options)
+        except WebDriverException as exc:
+            logger.error(f"Failed to initialize Chrome WebDriver: {exc}")
+            raise
+        return driver
+
+    def close(self) -> None:
+        try:
+            if self.driver:
+                self.driver.quit()
+        except Exception:
+            pass
+
+    def _clear_temp_downloads(self) -> None:
+        for artifact in self.temp_dir.glob("*"):
+            if artifact.is_file():
+                artifact.unlink(missing_ok=True)
+
+    def _wait_for_download(self, timeout: int = 60) -> Optional[Path]:
+        elapsed = 0
+        while elapsed < timeout:
+            pdfs = [p for p in self.temp_dir.glob("*") if p.is_file() and not p.name.startswith(".")]
+            pending = list(self.temp_dir.glob("*.crdownload"))
+            if pdfs and not pending:
+                return pdfs[0]
+            if pdfs and not pending:
+                return pdfs[0]
+            time.sleep(1)
+            elapsed += 1
+        return None
+
+    def _apply_driver_cookies_to_session(self) -> None:
+        self.session.cookies.clear()
+        for cookie in self.driver.get_cookies():
+            try:
+                self.session.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain"))
+            except Exception:
+                continue
+
+    @staticmethod
+    def _find_pdf_link_in_html(html: bytes, base_url: str) -> Optional[str]:
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Meta refresh tag
+        meta_refresh = soup.find("meta", attrs={"http-equiv": lambda v: v and v.lower() == "refresh"})
+        if meta_refresh:
+            content = meta_refresh.get("content", "")
+            if "url=" in content.lower():
+                target = content.split("=", 1)[1].strip()
+                if target:
+                    resolved = urljoin(base_url, target)
+                    if resolved.lower().endswith(".pdf"):
+                        return resolved
+
+        # Common tags that may embed PDF links
+        for tag, attr in [("a", "href"), ("iframe", "src"), ("embed", "src"), ("object", "data")]:
+            for element in soup.find_all(tag):
+                href = element.get(attr)
+                if not href:
+                    continue
+                resolved = urljoin(base_url, href)
+                if ".pdf" in resolved.lower():
+                    return resolved
+        return None
+
+    def _download_pdf(
+        self,
+        pdf_url: str,
+        referer: str,
+        link_text: str,
+        is_table_link: bool,
+        attempt: int = 0,
+    ) -> bool:
+        if attempt > 3:
+            logger.warning(f"Exceeded retry attempts while resolving {pdf_url}")
+            return False
+
+        probable_pdf = is_probable_pdf(pdf_url)
+
+        self._clear_temp_downloads()
+
+        downloaded_path: Optional[Path] = None
+
+        try:
+            self._apply_driver_cookies_to_session()
+            response = self.session.get(
+                pdf_url,
+                headers={
+                    "Referer": referer,
+                    "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+                },
+                stream=True,
+                timeout=45,
+            )
+
+            if response.status_code == 403:
+                logger.debug(f"Direct download blocked (403); attempting browser download for {pdf_url}")
+                existing_handles = list(self.driver.window_handles)
+
+                try:
+                    self.driver.switch_to.new_window("tab")
+                    self.driver.get(pdf_url)
+                except Exception:
+                    self.driver.execute_script("window.open(arguments[0], '_blank');", pdf_url)
+                    time.sleep(1)
+                    new_handles = self.driver.window_handles
+                    target_handle = None
+                    for handle in new_handles:
+                        if handle not in existing_handles:
+                            target_handle = handle
+                            break
+                    if target_handle:
+                        self.driver.switch_to.window(target_handle)
+
+                downloaded_path = self._wait_for_download()
+
+                # Close the temporary tab/window if it still exists
+                remaining_handles = self.driver.window_handles
+                for handle in list(remaining_handles):
+                    if handle not in existing_handles:
+                        try:
+                            self.driver.switch_to.window(handle)
+                            self.driver.close()
+                        except Exception:
+                            logger.debug("Temporary download window already closed.")
+
+                if existing_handles:
+                    try:
+                        self.driver.switch_to.window(existing_handles[0])
+                    except Exception:
+                        logger.debug("Original window already closed after download.")
+                if not downloaded_path or not downloaded_path.exists():
+                    resolved = self._resolve_pdf_via_browser(pdf_url)
+                    if resolved and resolved != pdf_url:
+                        return self._download_pdf(resolved, referer, link_text, is_table_link, attempt + 1)
+                    return False
+            else:
+                content_type = response.headers.get("content-type", "").lower()
+                if "application/pdf" not in content_type:
+                    html_bytes = response.content
+                    pdf_candidate = self._find_pdf_link_in_html(html_bytes, pdf_url)
+                    if pdf_candidate and pdf_candidate != pdf_url:
+                        logger.debug(f"Resolved HTML intermediate to PDF: {pdf_candidate}")
+                        return self._download_pdf(pdf_candidate, referer, link_text, is_table_link, attempt + 1)
+                    resolved = self._resolve_pdf_via_browser(pdf_url)
+                    if resolved and resolved != pdf_url:
+                        logger.debug(f"Browser resolved PDF URL: {resolved}")
+                        return self._download_pdf(resolved, referer, link_text, is_table_link, attempt + 1)
+                    logger.debug(f"Non-PDF content returned from {pdf_url}; skipping.")
+                    return False
+
+                filename = self._select_filename(pdf_url, response.headers, link_text)
+                downloaded_path = self._prepare_temp_path(filename)
+
+                with open(downloaded_path, "wb") as fh:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            fh.write(chunk)
+        except Exception as exc:
+            logger.warning(f"Error downloading {pdf_url}: {exc}")
+            return False
+
+        if not downloaded_path or not downloaded_path.exists():
+            logger.warning(f"Download did not complete for {pdf_url}")
+            return False
+
+        final_name = downloaded_path.name
+        final_path = self._prepare_final_path(final_name)
+        downloaded_path.replace(final_path)
+
+        tag = " [TABLE]" if is_table_link else ""
+        logger.info(f"Downloaded: {final_path.name}{tag}")
+        return True
+
+    def _resolve_pdf_via_browser(self, url: str) -> Optional[str]:
+        """Open the URL in a temporary browser tab and try to discover an embedded PDF resource."""
+        existing_handles = list(self.driver.window_handles)
+        try:
+            self.driver.switch_to.new_window("tab")
+        except Exception:
+            self.driver.execute_script("window.open('about:blank','_blank');")
+            time.sleep(1)
+            new_handles = self.driver.window_handles
+            self.driver.switch_to.window(new_handles[-1])
+
+        try:
+            self.driver.get(url)
+            WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located(
+                    (
+                        By.XPATH,
+                        "//iframe[@src]|//embed[@src]|//object[@data]|//a[contains(@href, '.pdf') or contains(@href, 'document')]",
+                    )
+                )
+            )
+        except Exception:
+            pass
+
+        resolved_url: Optional[str] = None
+        for locator, attr in [
+            ((By.TAG_NAME, "embed"), "src"),
+            ((By.TAG_NAME, "iframe"), "src"),
+            ((By.TAG_NAME, "object"), "data"),
+        ]:
+            try:
+                element = self.driver.find_element(*locator)
+                candidate = element.get_attribute(attr)
+                if candidate:
+                    resolved_url = urljoin(url, candidate)
+                    break
+            except Exception:
+                continue
+
+        if not resolved_url:
+            try:
+                download_link = self.driver.find_element(By.XPATH, "//a[contains(@href, '.pdf') or contains(@href, 'document')]")
+                href = download_link.get_attribute("href")
+                if href:
+                    resolved_url = urljoin(url, href)
+            except Exception:
+                pass
+
+        try:
+            current_url = self.driver.current_url
+            if current_url and current_url != "data:" and current_url != url:
+                resolved_url = current_url
+        except Exception:
+            pass
+
+        # Close temporary tabs/windows
+        new_handles = list(self.driver.window_handles)
+        for handle in new_handles:
+            if handle not in existing_handles:
+                try:
+                    self.driver.switch_to.window(handle)
+                    self.driver.close()
+                except Exception:
+                    logger.debug("Temporary resolution window already closed.")
+
+        if existing_handles:
+            try:
+                self.driver.switch_to.window(existing_handles[0])
+            except Exception:
+                logger.debug("Original window not available after resolution.")
+
+        return resolved_url
+
+    def _select_filename(self, url: str, headers: dict, link_text: str) -> str:
+        disposition = headers.get("content-disposition", "")
+        filename = ""
+        if "filename=" in disposition.lower():
+            parts = disposition.split(";")
+            for part in parts:
+                if "filename=" in part.lower():
+                    filename = part.split("=", 1)[1].strip().strip("\"'")
+                    break
+
+        if not filename:
+            parsed_name = os.path.basename(urlparse(url).path)
+            if parsed_name:
+                filename = parsed_name
+
+        if not filename and link_text:
+            filename = link_text
+
+        if not filename:
+            filename = "document.pdf"
+
+        if not filename.lower().endswith(".pdf"):
+            filename = f"{filename}.pdf"
+
+        return filename
+
+    def _prepare_temp_path(self, filename: str) -> Path:
+        return self.temp_dir / filename
+
+    def _prepare_final_path(self, filename: str) -> Path:
+        return self.output_dir / filename
+
+    def download_document(
+        self, doc_url: str, referer: str, link_text: str = "", is_table_link: bool = False
+    ) -> bool:
+        """
+        Public wrapper for downloading a specific document URL using the current browser session.
+        """
+        return self._download_pdf(doc_url, referer, link_text, is_table_link)
+
+    def _extract_links(self, soup: BeautifulSoup) -> Tuple[List[LinkCandidate], List[LinkCandidate]]:
         navigation_selectors = [
-            'nav', '.nav', '.navigation', '.menu', '.navbar',
-            '.header', '.footer', '.sidebar', '.breadcrumb',
-            '.panel-sidebar', '.rail', '.left-rail', '.right-rail',
-            '.quick-links', '.related-links', '.see-also', '.in-this-section'
+            "nav",
+            ".nav",
+            ".navigation",
+            ".menu",
+            ".navbar",
+            ".header",
+            ".footer",
+            ".sidebar",
+            ".breadcrumb",
+            ".panel-sidebar",
+            ".rail",
+            ".left-rail",
+            ".right-rail",
+            ".quick-links",
+            ".related-links",
+            ".see-also",
+            ".in-this-section",
         ]
-        
-        # Remove these elements from the soup
+
         for selector in navigation_selectors:
             for element in soup.select(selector):
                 element.decompose()
-        
-        # Find all links in the remaining content (main body)
-        all_links = soup.find_all('a')
-        
-        # Separate table links from other links (prioritize table links)
-        table_links = []
-        other_links = []
-        
-        for link in all_links:
-            # Check if link is inside a table
-            if link.find_parent('table'):
-                table_links.append(link)
-            else:
-                other_links.append(link)
-        
-        # Process table links first (higher priority), then other links
-        links = table_links + other_links
-        
-        permit_links = []
-        llm_candidate_links = []
-        
-        print(f"{'  ' * depth}Found {len(table_links)} table links and {len(other_links)} other content links")
-        
-        # Process each link (table links processed first due to ordering above)
-        for i, link in enumerate(links):
-            is_table_link = i < len(table_links)  # First portion are table links
-            href = link.get('href')
-            if href:
-                # Convert relative URL to absolute URL
-                full_url = urljoin(url, href)
-                
-                # Skip external domains to avoid crawling the entire internet
-                if urlparse(full_url).netloc != urlparse(url).netloc:
-                    continue
-                
-                try:
-                    # Get the file
-                    file_response = requests.get(full_url, stream=True, timeout=30)
-                    file_response.raise_for_status()
-                    
-                    # Check if it's a PDF
-                    if is_pdf_link(full_url, file_response):
-                        # Get the link text and clean it
-                        link_text = link.get_text().strip()
-                        if link_text:
-                            filename = clean_filename(link_text)
-                        else:
-                            # If no link text, try to get filename from URL or Content-Disposition
-                            filename = os.path.basename(urlparse(full_url).path)
-                            if not filename or filename == '':
-                                content_disposition = file_response.headers.get('content-disposition')
-                                if content_disposition:
-                                    filename_match = re.findall("filename=(.+)", content_disposition)
-                                    if filename_match:
-                                        filename = filename_match[0].strip('"')
-                            
-                            # If still no filename, use a default name
-                            if not filename:
-                                filename = f"document_{len(os.listdir(output_dir)) + 1}"
-                        
-                        # Ensure filename ends with .pdf
-                        if not filename.lower().endswith('.pdf'):
-                            filename += '.pdf'
-                        
-                        # Create unique filename if file already exists
-                        counter = 1
-                        original_filename = filename
-                        while os.path.exists(os.path.join(output_dir, filename)):
-                            name, ext = os.path.splitext(original_filename)
-                            filename = f"{name}_{counter}{ext}"
-                            counter += 1
-                        
-                        # Save the file
-                        filepath = os.path.join(output_dir, filename)
-                        with open(filepath, 'wb') as f:
-                            for chunk in file_response.iter_content(chunk_size=8192):
-                                if chunk:
-                                    f.write(chunk)
-                        
-                        table_indicator = " [TABLE]" if is_table_link else ""
-                        print(f"{'  ' * depth}Downloaded: {filename}{table_indicator}")
-                        downloaded_count += 1
-                        
-                        # Add a small delay to be nice to the server
-                        time.sleep(1)
-                    
-                    # If we haven't reached max depth and this link might lead to permits
-                    elif depth < max_depth and full_url not in visited_urls:
-                        link_text = link.get_text().strip()
-                        
-                        # First pass: keyword-based detection
-                        if is_permit_related_link_keywords(link_text, href):
-                            table_indicator = " [TABLE]" if is_table_link else ""
-                            permit_links.append((full_url, link_text, is_table_link))
-                            print(f"{'  ' * depth}Found permit link: {link_text[:40]}{'...' if len(link_text) > 40 else ''}{table_indicator}")
-                        # Second pass: collect for Gemini evaluation if enabled
-                        elif use_llm and LLM_ENABLED:
-                            context = get_link_context(link, soup)
-                            llm_candidate_links.append((full_url, link_text, context, is_table_link))
-                    
-                except Exception as e:
-                    print(f"{'  ' * depth}Error accessing {full_url}: {str(e)}")
-        
-        # Use Gemini to evaluate remaining links if enabled
-        if use_llm and LLM_ENABLED and llm_candidate_links and depth < max_depth:
-            print(f"{'  ' * depth}Using Gemini to evaluate {len(llm_candidate_links)} additional links...")
-            page_title = soup.title.string if soup.title else ""
-            page_context = f"Page title: {page_title}"
-            
-            llm_permit_links = evaluate_links_with_llm(llm_candidate_links, page_context)
-            
-            # Add high-confidence Gemini suggestions to permit_links
-            for url_link, link_text, confidence, facility_name, is_table_link in llm_permit_links:
-                if confidence >= 0.6:  # Only follow links with 60%+ confidence
-                    table_indicator = " [TABLE]" if is_table_link else ""
-                    permit_links.append((url_link, link_text, is_table_link))
-                    print(f"{'  ' * depth}Gemini identified facility: {facility_name} - {link_text[:30]}{'...' if len(link_text) > 30 else ''}{table_indicator} (confidence: {confidence:.2f})")
-        
-        # Follow permit-related links if we haven't reached max depth
-        if depth < max_depth and permit_links:
-            # Sort permit_links to prioritize table links
-            permit_links.sort(key=lambda x: (not x[2], x[0]))  # Sort by (not is_table_link, url) - table links first
-            
-            print(f"{'  ' * depth}Found {len(permit_links)} potential permit-related links to explore...")
-            for permit_url, link_text, is_table_link in permit_links:
-                print(f"{'  ' * depth}Following permit link: {link_text[:50]}{'...' if len(link_text) > 50 else ''}")
-                downloaded_count += download_pdf_from_page(
-                    permit_url, output_dir, visited_urls, depth + 1, max_depth, use_llm
-                )
-                # Add delay between page requests
-                time.sleep(2)
-        
-    except Exception as e:
-        print(f"{'  ' * depth}Error accessing {url}: {str(e)}")
-    
-    return downloaded_count
 
-def download_pdf(url, output_dir=f'{RAW_DATA_DIR}/downloaded_pdfs', max_depth=2, use_llm=True):
-    """
-    Download PDF files from a given URL and follow facility-specific permit links.
-    
-    Args:
-        url (str): The URL of the website to scrape for PDFs
-        output_dir (str): Directory where PDFs will be saved
-        max_depth (int): Maximum depth to follow permit-related links (0 = no following, 1 = one level, etc.)
-        use_llm (bool): Whether to use Gemini for enhanced link identification
-    """
-    # Create output directory if it doesn't exist
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    
-    visited_urls = set()
-    
-    print(f"Starting PDF download from: {url}")
-    print(f"Maximum link depth: {max_depth}")
-    print("Target: Facility-specific permit documents only")
-    if use_llm and LLM_ENABLED:
-        print(f"Gemini-enhanced facility detection: ENABLED (using {LLM_MODEL})")
+        table_links: List[LinkCandidate] = []
+        other_links: List[LinkCandidate] = []
+
+        for link in soup.find_all("a"):
+            href = link.get("href")
+            if not href:
+                continue
+
+            context = get_link_context(link, soup)
+            candidate = LinkCandidate(
+                url=href,
+                text=link.get_text().strip(),
+                context=context,
+                in_table=bool(link.find_parent("table")),
+            )
+
+            if candidate.in_table:
+                table_links.append(candidate)
+            else:
+                other_links.append(candidate)
+
+        return table_links, other_links
+
+    def _process_page(self, url: str, depth: int) -> int:
+        if url in self.visited_urls:
+            return 0
+
+        logger.info(f"{'  ' * depth}Processing: {url}")
+        self.visited_urls.add(url)
+
+        try:
+            self.driver.get(url)
+        except Exception as exc:
+            logger.warning(f"{'  ' * depth}Failed to load {url}: {exc}")
+            return 0
+
+        try:
+            WebDriverWait(self.driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        except Exception:
+            logger.debug(f"{'  ' * depth}Timed out waiting for body tag on {url}")
+
+        time.sleep(self.wait_seconds)
+
+        current_domain = urlparse(url).netloc
+        soup = BeautifulSoup(self.driver.page_source, "html.parser")
+
+        table_links, other_links = self._extract_links(soup)
+        logger.info(
+            f"{'  ' * depth}Found {len(table_links)} table links and {len(other_links)} other content links"
+        )
+
+        download_count = 0
+        permit_links: List[Tuple[str, str, bool]] = []
+        llm_candidates: List[Tuple[str, str, str, bool]] = []
+
+        for candidate in table_links + other_links:
+            full_url = urljoin(url, candidate.url)
+
+            if urlparse(full_url).netloc != current_domain:
+                continue
+
+            should_try_download = is_probable_pdf(full_url) or candidate.in_table
+            if should_try_download:
+                success = self._download_pdf(full_url, url, candidate.text, candidate.in_table)
+                if success:
+                    download_count += 1
+                    time.sleep(1)
+                    continue
+
+            if depth < self.max_depth and full_url not in self.visited_urls:
+                if is_permit_related_link_keywords(candidate.text, candidate.url):
+                    permit_links.append((full_url, candidate.text, candidate.in_table))
+                    logger.debug(
+                        f"{'  ' * depth}Keyword permit link: {candidate.text[:60]}"
+                        f"{' [TABLE]' if candidate.in_table else ''}"
+                    )
+                elif self.use_llm:
+                    llm_candidates.append(
+                        (full_url, candidate.text, candidate.context, candidate.in_table)
+                    )
+
+        if self.use_llm and llm_candidates and depth < self.max_depth:
+            logger.info(f"{'  ' * depth}Sending {len(llm_candidates)} links to Gemini for scoring…")
+            page_title = soup.title.string if soup.title else ""
+            llm_results = evaluate_links_with_llm(llm_candidates, f"Page title: {page_title}")
+            for url_link, link_text, confidence, facility_name, in_table in llm_results:
+                if confidence >= 0.6:
+                    permit_links.append((url_link, link_text, in_table))
+                    logger.info(
+                        f"{'  ' * depth}Gemini identified {facility_name} via '{link_text[:60]}' "
+                        f"(confidence {confidence:.2f})"
+                    )
+
+        if depth < self.max_depth and permit_links:
+            permit_links.sort(key=lambda item: (not item[2], item[0]))
+            logger.info(f"{'  ' * depth}Exploring {len(permit_links)} deeper permit pages…")
+            for link_url, link_text, in_table in permit_links:
+                logger.info(
+                    f"{'  ' * depth}→ Following: {link_text[:70]}"
+                    f"{' [TABLE]' if in_table else ''}"
+                )
+                download_count += self._process_page(link_url, depth + 1)
+                time.sleep(2)
+
+        return download_count
+
+    def crawl(self, start_url: str) -> int:
+        total_downloaded = self._process_page(start_url, depth=0)
+        return total_downloaded
+
+
+def download_pdf(
+    url: str,
+    output_dir: str = f"{RAW_DATA_DIR}/downloaded_pdfs",
+    max_depth: int = 2,
+    use_llm: bool = True,
+    headless: bool = True,
+    wait_seconds: int = 4,
+) -> int:
+    output_path = Path(output_dir)
+    downloader = SeleniumPDFDownloader(
+        output_dir=output_path,
+        headless=headless,
+        wait_seconds=wait_seconds,
+        max_depth=max_depth,
+        use_llm=use_llm,
+    )
+
+    logger.info(f"Starting PDF download from: {url}")
+    logger.info(f"Maximum link depth: {max_depth}")
+    logger.info("Target: Facility-specific permit documents only")
+    if downloader.use_llm:
+        logger.info(f"Gemini-enhanced facility detection ENABLED ({LLM_MODEL})")
     elif use_llm and not LLM_ENABLED:
-        print("Gemini-enhanced facility detection: DISABLED (no API key found)")
-        use_llm = False
+        logger.info("Gemini-enhanced facility detection DISABLED (API key missing)")
     else:
-        print("Gemini-enhanced facility detection: DISABLED")
-    print("-" * 50)
-    
-    total_downloaded = download_pdf_from_page(url, output_dir, visited_urls, 0, max_depth, use_llm)
-    
-    print("-" * 50)
-    print(f"Download complete! Downloaded {total_downloaded} PDF files to {output_dir}")
-    print(f"Visited {len(visited_urls)} unique URLs")
-    
+        logger.info("Gemini-enhanced facility detection DISABLED")
+    logger.info("-" * 60)
+
+    try:
+        total_downloaded = downloader.crawl(url)
+    finally:
+        downloader.close()
+
+    logger.info("-" * 60)
+    logger.info(f"Download complete! Downloaded {total_downloaded} PDF files to {output_path}")
+    logger.info(f"Visited {len(downloader.visited_urls)} unique URLs")
+
     return total_downloaded
 
-def download_pdfs_from_csv(csv_path, output_dir=f'{RAW_DATA_DIR}/downloaded_pdfs', max_depth=2, use_llm=True, url_column='url'):
-    """
-    Download PDFs from multiple URLs specified in a CSV file.
-    
-    Args:
-        csv_path (str): Path to the CSV file containing URLs
-        output_dir (str): Directory where PDFs will be saved
-        max_depth (int): Maximum depth to follow permit-related links
-        use_llm (bool): Whether to use Gemini for enhanced link identification
-        url_column (str): Name of the column containing URLs in the CSV
-    
-    Returns:
-        dict: Summary of downloads for each URL
-    """
+
+def download_pdfs_from_csv(
+    csv_path: str,
+    output_dir: str = f"{RAW_DATA_DIR}/downloaded_pdfs",
+    max_depth: int = 2,
+    use_llm: bool = True,
+    url_column: str = "url",
+    headless: bool = True,
+    wait_seconds: int = 4,
+) -> dict:
     try:
-        # Read the CSV file
         df = pd.read_csv(csv_path)
-        
-        if url_column not in df.columns:
-            print(f"Error: Column '{url_column}' not found in CSV. Available columns: {list(df.columns)}")
-            return {}
-        
-        # Get unique URLs (remove duplicates)
-        urls = df[url_column].dropna().unique()
-        
-        print(f"Found {len(urls)} unique URLs in CSV file: {csv_path}")
-        print(f"URL column: '{url_column}'")
-        print("-" * 50)
-        
-        # Create output directory if it doesn't exist
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        
-        # Process each URL
-        results = {}
-        total_downloaded = 0
-        
-        for i, url in enumerate(urls, 1):
-            print(f"\nProcessing URL {i}/{len(urls)}: {url}")
-            print("=" * 60)
-            
-            # Create a subdirectory for each URL to organize downloads
-            url_clean = re.sub(r'[<>:"/\\|?*]', '', url.replace('://', '_').replace('/', '_'))
-            url_output_dir = os.path.join(output_dir, url_clean)
-            
-            try:
-                downloaded_count = download_pdf(url, url_output_dir, max_depth, use_llm)
-                results[url] = {
-                    'status': 'success',
-                    'downloaded': downloaded_count,
-                    'output_dir': url_output_dir
-                }
-                total_downloaded += downloaded_count
-                
-            except Exception as e:
-                print(f"Error processing {url}: {str(e)}")
-                results[url] = {
-                    'status': 'error',
-                    'error': str(e),
-                    'downloaded': 0,
-                    'output_dir': url_output_dir
-                }
-            
-            # Add delay between different websites to be respectful
-            if i < len(urls):
-                print(f"\nWaiting 5 seconds before processing next URL...")
-                time.sleep(5)
-        
-        # Print summary
-        print("\n" + "=" * 60)
-        print("BATCH DOWNLOAD SUMMARY")
-        print("=" * 60)
-        print(f"Total URLs processed: {len(urls)}")
-        print(f"Total PDFs downloaded: {total_downloaded}")
-        print(f"Output directory: {output_dir}")
-        
-        successful = sum(1 for r in results.values() if r['status'] == 'success')
-        failed = len(results) - successful
-        
-        print(f"Successful downloads: {successful}")
-        print(f"Failed downloads: {failed}")
-        
-        if failed > 0:
-            print("\nFailed URLs:")
-            for url, result in results.items():
-                if result['status'] == 'error':
-                    print(f"  - {url}: {result['error']}")
-        
-        return results
-        
-    except Exception as e:
-        print(f"Error reading CSV file {csv_path}: {str(e)}")
+    except Exception as exc:
+        logger.error(f"Error reading CSV file {csv_path}: {exc}")
         return {}
 
+    if url_column not in df.columns:
+        logger.error(f"Column '{url_column}' not found in CSV. Available: {list(df.columns)}")
+        return {}
+
+    urls = df[url_column].dropna().unique()
+    logger.info(f"Found {len(urls)} unique URLs in CSV ({csv_path})")
+
+    results = {}
+    total_downloaded = 0
+
+    for idx, url in enumerate(urls, start=1):
+        logger.info("=" * 60)
+        logger.info(f"Processing URL {idx}/{len(urls)}: {url}")
+
+        safe_dir_name = re.sub(r'[<>:"/\\|?*]', "", url.replace("://", "_").replace("/", "_"))
+        url_output_dir = Path(output_dir) / safe_dir_name
+
+        try:
+            count = download_pdf(
+                url,
+                output_dir=url_output_dir,
+                max_depth=max_depth,
+                use_llm=use_llm,
+                headless=headless,
+                wait_seconds=wait_seconds,
+            )
+            results[url] = {
+                "status": "success",
+                "downloaded": count,
+                "output_dir": str(url_output_dir),
+            }
+            total_downloaded += count
+        except Exception as exc:
+            logger.error(f"Error processing {url}: {exc}")
+            results[url] = {
+                "status": "error",
+                "error": str(exc),
+                "downloaded": 0,
+                "output_dir": str(url_output_dir),
+            }
+
+        if idx < len(urls):
+            logger.info("Waiting 5 seconds before next URL…")
+            time.sleep(5)
+
+    logger.info("=" * 60)
+    logger.info("BATCH DOWNLOAD SUMMARY")
+    logger.info("=" * 60)
+    logger.info(f"Total URLs processed: {len(urls)}")
+    logger.info(f"Total PDFs downloaded: {total_downloaded}")
+    logger.info(f"Output directory: {output_dir}")
+
+    success_count = sum(1 for result in results.values() if result["status"] == "success")
+    logger.info(f"Successful downloads: {success_count}")
+    logger.info(f"Failed downloads: {len(results) - success_count}")
+
+    if success_count != len(results):
+        logger.info("Failed URLs:")
+        for url, result in results.items():
+            if result["status"] == "error":
+                logger.info(f"  - {url}: {result['error']}")
+
+    return results
+
+
 if __name__ == "__main__":
-    # Ask user for input method
     print("PDF Downloader - Choose input method:")
     print("1. Single URL")
     print("2. CSV file with URLs")
-    
+
     choice = input("Enter your choice (1 or 2): ").strip()
-    
+
+    use_llm = False
+    if LLM_ENABLED:
+        use_llm_input = input("Use Gemini to identify facility-specific permits? (y/n, default=y): ").lower()
+        use_llm = use_llm_input != "n"
+    else:
+        print("Gemini not available (set API_KEY environment variable to enable)")
+
+    try:
+        max_depth = int(
+            input("Enter maximum link depth to follow (0=no following, 1=one level, 2=two levels, etc.): ") or "2"
+        )
+    except ValueError:
+        max_depth = 2
+        print("Invalid input, using default depth of 2")
+
+    headless_choice = input("Run browser headless? (y/n, default=y): ").strip().lower()
+    headless = headless_choice != "n"
+
+    wait_seconds_input = input("Seconds to wait for page rendering (default=4): ").strip()
+    try:
+        wait_seconds = int(wait_seconds_input) if wait_seconds_input else 4
+    except ValueError:
+        wait_seconds = 4
+        print("Invalid wait seconds, using default 4")
+
     if choice == "2":
-        # CSV file input
         csv_path = input("Enter the path to your CSV file: ").strip()
         if not csv_path:
             print("No CSV path provided. Exiting.")
-            exit()
-        
-        # Ask for URL column name
-        url_column = input("Enter the name of the column containing URLs (default: 'url'): ").strip()
-        if not url_column:
-            url_column = 'url'
-        
-        # Ask user for maximum depth
-        try:
-            max_depth = int(input("Enter maximum link depth to follow (0=no following, 1=one level, 2=two levels, etc.): ") or "2")
-        except ValueError:
-            max_depth = 2
-            print("Invalid input, using default depth of 2")
-        
-        # Ask user about Gemini usage
-        if LLM_ENABLED:
-            use_llm_input = input("Use Gemini to identify facility-specific permits? (y/n, default=y): ").lower()
-            use_llm = use_llm_input != 'n'
-        else:
-            print("Gemini not available (set API_KEY environment variable to enable)")
-            use_llm = False
-        
-        # Process CSV file
-        download_pdfs_from_csv(csv_path, max_depth=max_depth, use_llm=use_llm, url_column=url_column)
-        
+            raise SystemExit(0)
+
+        url_column = input("Enter the name of the column containing URLs (default: 'url'): ").strip() or "url"
+        download_pdfs_from_csv(
+            csv_path,
+            max_depth=max_depth,
+            use_llm=use_llm,
+            url_column=url_column,
+            headless=headless,
+            wait_seconds=wait_seconds,
+        )
     else:
-        # Single URL input (original functionality)
-        website_url = input("Enter the website URL to download PDFs from: ")
-        
-        # Ask user for maximum depth
-        try:
-            max_depth = int(input("Enter maximum link depth to follow (0=no following, 1=one level, 2=two levels, etc.): ") or "2")
-        except ValueError:
-            max_depth = 2
-            print("Invalid input, using default depth of 2")
-        
-        # Ask user about Gemini usage
-        if LLM_ENABLED:
-            use_llm_input = input("Use Gemini to identify facility-specific permits? (y/n, default=y): ").lower()
-            use_llm = use_llm_input != 'n'
-        else:
-            print("Gemini not available (set API_KEY environment variable to enable)")
-            use_llm = False
-        
-        download_pdf(website_url, max_depth=max_depth, use_llm=use_llm) 
+        website_url = input("Enter the website URL to download PDFs from: ").strip()
+        if not website_url:
+            print("No URL provided. Exiting.")
+            raise SystemExit(0)
+
+        download_pdf(
+            website_url,
+            max_depth=max_depth,
+            use_llm=use_llm,
+            headless=headless,
+            wait_seconds=wait_seconds,
+        )
+

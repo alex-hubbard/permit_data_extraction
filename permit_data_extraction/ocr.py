@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 import logging
 import gc  # Import the garbage collection module
+import shutil
+import time
 
 # OCR specific imports
 try:
@@ -26,6 +28,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # Directory containing your PDF permit files
 PDF_INPUT_DIR = Path(RAW_DATA_DIR)  # Example: Path('./raw_permits')
+# Directory to move successfully processed PDF files
+PROCESSED_PDF_DIR = PDF_INPUT_DIR / "processed"
 
 # Directory where extracted .txt files will be saved
 TEXT_OUTPUT_DIR = Path(INTERIM_DATA_DIR / 'extracted_text')
@@ -209,6 +213,24 @@ def save_text_to_file(text_content, output_path):
     except Exception as e:
         logging.error(f"    Error saving text to {output_path}: {e}", exc_info=True)
 
+
+def move_processed_pdf(pdf_path, destination_dir):
+    """Move a successfully processed PDF to the destination directory."""
+    try:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination_path = destination_dir / pdf_path.name
+
+        if destination_path.exists():
+            timestamp = int(time.time())
+            destination_path = destination_dir / f"{pdf_path.stem}_{timestamp}{pdf_path.suffix}"
+
+        shutil.move(str(pdf_path), destination_path)
+        logging.info(f"    Moved processed PDF to {destination_path}")
+        return destination_path
+    except Exception as e:
+        logging.error(f"    Failed to move processed PDF {pdf_path} to {destination_dir}: {e}", exc_info=True)
+        return None
+
 # --- Main Execution ---
 def main():
     logging.info("Starting PDF to Text Conversion Process...")
@@ -244,6 +266,8 @@ def main():
         return
     if not TEXT_OUTPUT_DIR.exists():
         TEXT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    if not PROCESSED_PDF_DIR.exists():
+        PROCESSED_PDF_DIR.mkdir(parents=True, exist_ok=True)
 
     pdf_files = list(PDF_INPUT_DIR.glob('*.pdf'))
     if not pdf_files:
@@ -262,7 +286,14 @@ def main():
             output_filename = pdf_path.stem + ".txt"
             output_file_path = TEXT_OUTPUT_DIR / output_filename
             save_text_to_file(text_content, output_file_path)
-            summary.append({"filename": pdf_path.name, "status": "Success", "method": method, "output_file": str(output_file_path)})
+            moved_path = move_processed_pdf(pdf_path, PROCESSED_PDF_DIR)
+            summary.append({
+                "filename": pdf_path.name,
+                "status": "Success",
+                "method": method,
+                "output_file": str(output_file_path),
+                "processed_pdf": str(moved_path) if moved_path else None
+            })
         else:
             logging.warning(f"  No text extracted from {pdf_path.name}. Method: {method}")
             summary.append({"filename": pdf_path.name, "status": "Failed", "method": method, "output_file": None})
