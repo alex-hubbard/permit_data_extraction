@@ -269,7 +269,25 @@ def main():
     if not PROCESSED_PDF_DIR.exists():
         PROCESSED_PDF_DIR.mkdir(parents=True, exist_ok=True)
 
-    pdf_files = list(PDF_INPUT_DIR.glob('*.pdf'))
+    def iter_pdf_files(root_dir: Path):
+        """Yield PDF files from root_dir and its subdirectories, excluding the processed directory."""
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            current_path = Path(dirpath)
+
+            if current_path == PROCESSED_PDF_DIR:
+                dirnames[:] = []
+                continue
+
+            dirnames[:] = [
+                dirname for dirname in dirnames
+                if (current_path / dirname) != PROCESSED_PDF_DIR
+            ]
+
+            for filename in filenames:
+                if filename.lower().endswith('.pdf'):
+                    yield current_path / filename
+
+    pdf_files = list(iter_pdf_files(PDF_INPUT_DIR))
     if not pdf_files:
         logging.warning(f"No PDF files found in '{PDF_INPUT_DIR}'.")
         return

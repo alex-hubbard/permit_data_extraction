@@ -5,6 +5,7 @@ import time  # To add delays between API calls if needed
 import re
 import shutil
 import requests
+from datetime import datetime
 from urllib.parse import quote_plus
 
 import openai
@@ -34,6 +35,12 @@ FAILED_DIR = TEXT_INPUT_DIR / 'failed'
 # Path for the output Excel file
 OUTPUT_EXCEL_FILE = os.path.join(PROCESSED_DATA_DIR,
                                  'permit_data_extracted.xlsx')
+
+# Feature flags
+ENABLE_SPEC_SHEET_LOOKUP = False
+
+# LLM model configuration
+LLM_MODEL = "lbl/llama"
 
 # General permit info
 GENERAL_TARGET_FIELDS = [
@@ -70,6 +77,7 @@ UNIT_DETAIL_FIELDS = [
     "Fuel Type",  # e.g., Natural Gas, Coal, etc.
     "Rated Efficiency", # e.g., 90%
     "Annual Run Hours", # e.g., 8760 hours
+    "Generation Capacity", # e.g., 100 MW
 ]
 # All fields expected in the final Excel output
 ALL_OUTPUT_FIELDS = GENERAL_TARGET_FIELDS + UNIT_DETAIL_FIELDS
@@ -148,12 +156,16 @@ def setup_directories():
 
 
 def move_processed_file(file_path, success=True):
-    """Move a processed file to the appropriate folder (completed or failed)."""
+    """Move a processed file to the appropriate folder (completed or failed).
+    Completed files are organized by date in subfolders (YYYY-MM-DD).
+    """
     try:
         # Choose destination directory based on success
         if success:
-            destination_dir = COMPLETED_DIR
-            folder_name = "completed"
+            # Organize completed files by date
+            current_date = datetime.now().strftime("%Y-%m-%d")
+            destination_dir = COMPLETED_DIR / current_date
+            folder_name = f"completed/{current_date}"
         else:
             destination_dir = FAILED_DIR
             folder_name = "failed"
@@ -181,6 +193,105 @@ def move_processed_file(file_path, success=True):
     except Exception as e:
         logging.error(f"  Failed to move {file_path.name} to {folder_name} folder: {e}")
         print(f"  → Warning: Could not move file to {folder_name} folder")
+
+
+def move_failed_files_back():
+    """Move files from the failed directory back to the main input directory for retry."""
+    if not FAILED_DIR.exists():
+        return []
+    
+    failed_files = list(FAILED_DIR.glob('*.txt'))
+    moved_files = []
+    
+    for failed_file in failed_files:
+        try:
+            # Handle timestamped files - extract original name
+            name_parts = failed_file.stem.split('_')
+            if len(name_parts) > 1 and name_parts[-1].isdigit():
+                # This is a timestamped file, use the original name
+                original_name = '_'.join(name_parts[:-1]) + failed_file.suffix
+                destination = TEXT_INPUT_DIR / original_name
+            else:
+                destination = TEXT_INPUT_DIR / failed_file.name
+            
+            # If file already exists in input directory, add a timestamp to the failed file
+            if destination.exists():
+                timestamp = int(time.time())
+                stem = failed_file.stem
+                suffix = failed_file.suffix
+                destination = TEXT_INPUT_DIR / f"{stem}_retry_{timestamp}{suffix}"
+            
+            # Move the file back
+            shutil.move(str(failed_file), str(destination))
+            moved_files.append(destination)
+            logging.info(f"  Moved {failed_file.name} back to input directory for retry")
+            
+        except Exception as e:
+            logging.error(f"  Failed to move {failed_file.name} back to input directory: {e}")
+    
+    return moved_files
+
+
+def append_rows_to_excel(new_rows, llm_client=None):
+    """
+    Append new rows to the Excel file, creating it if it doesn't exist.
+    Handles incremental saving to prevent data loss if script is interrupted.
+    
+    Args:
+        new_rows (list): List of dictionaries, each representing a row to add
+        llm_client: Optional LLM client for spec sheet lookup (not used in incremental saves)
+    """
+    if not new_rows:
+        return
+    
+    try:
+        # Add current date and model used to all new rows
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        for row in new_rows:
+            row["Processing Date"] = current_date
+            row["Model Used"] = LLM_MODEL
+        
+        # Define all expected columns
+        excel_columns = ["Filename", "Status", "Processing Date", "Model Used"] + ALL_OUTPUT_FIELDS + ["Spec Sheet Link"]
+        
+        # Ensure all columns exist in new rows
+        for row in new_rows:
+            for col in excel_columns:
+                if col not in row:
+                    row[col] = None
+        
+        # Create DataFrame from new rows
+        new_df = pd.DataFrame(new_rows)
+        new_df = new_df[excel_columns]
+        
+        # Check if Excel file exists
+        if os.path.exists(OUTPUT_EXCEL_FILE):
+            # Read existing file
+            existing_df = pd.read_excel(OUTPUT_EXCEL_FILE, engine='openpyxl')
+            
+            # Ensure existing file has all columns
+            for col in excel_columns:
+                if col not in existing_df.columns:
+                    existing_df[col] = None
+            
+            # Remove any rows that match the new rows (by Filename) to avoid duplicates when retrying
+            # This handles the case where we're retrying failed files
+            filenames_to_update = set(new_df['Filename'].unique())
+            existing_df = existing_df[~existing_df['Filename'].isin(filenames_to_update)]
+            
+            # Combine existing and new data
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+        else:
+            # Create new file
+            combined_df = new_df
+        
+        # Save to Excel
+        combined_df.to_excel(OUTPUT_EXCEL_FILE, index=False, engine='openpyxl')
+        logging.info(f"  Appended {len(new_rows)} row(s) to Excel file: {OUTPUT_EXCEL_FILE}")
+        
+    except Exception as e:
+        logging.error(f"Error appending rows to Excel: {e}", exc_info=True)
+        print(f"  Warning: Failed to save rows to Excel: {e}")
 
 
 def configure_llm():
@@ -513,7 +624,7 @@ Focus on official manufacturer websites, technical documentation sites, and dire
     
     try:
         response = client.chat.completions.create(
-            model="openai/gpt-4.1",
+            model="lbl/llama",
             messages=[
                 {"role": "system", "content": "You are an expert at identifying technical documentation from search results. Always respond with valid JSON."},
                 {"role": "user", "content": prompt}
@@ -620,6 +731,10 @@ def add_spec_sheet_links(df, llm_client=None):
     
     # Initialize the spec sheet link column
     df['Spec Sheet Link'] = ""
+
+    if not ENABLE_SPEC_SHEET_LOOKUP:
+        logging.info("Spec sheet lookup disabled by configuration. Skipping search.")
+        return df
     
     # Find rows that have both make and model
     has_make_model = df['Unit Make'].notna() & df['Unit Model'].notna() & (df['Unit Make'] != "") & (df['Unit Model'] != "")
@@ -700,7 +815,7 @@ def extract_info_with_llm(client, text_content, filename):
         
         logging.info(f"  Making API call for {filename}...")
         response = client.chat.completions.create(
-            model="openai/gpt-4.1",  # Using GPT-4 for better JSON parsing
+            model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": "You are an expert at extracting structured information from industrial air permit documents. Always respond with valid JSON."},
                 {"role": "user", "content": prompt}
@@ -757,7 +872,9 @@ def extract_info_with_llm(client, text_content, filename):
 
 
 @app.command()
-def main():
+def main(
+    retry_failed: bool = typer.Option(False, "--retry-failed", "-r", help="Retry processing files that previously failed")
+):
     print("Starting LLM Extraction Process from Text Files...")
     logging.info("Starting LLM Extraction Process from Text Files...")
 
@@ -776,15 +893,27 @@ def main():
     # Setup completed and failed directories
     setup_directories()
 
+    # If retry_failed is True, move failed files back to input directory
+    if retry_failed:
+        print("Retry mode: Moving failed files back to input directory...")
+        logging.info("Retry mode enabled: Moving failed files back to input directory")
+        moved_files = move_failed_files_back()
+        if moved_files:
+            print(f"  Moved {len(moved_files)} failed file(s) back to input directory for retry")
+            logging.info(f"Moved {len(moved_files)} failed file(s) back to input directory for retry")
+        else:
+            print("  No failed files found to retry")
+            logging.info("No failed files found to retry")
+
     # Get all .txt files from the main directory (excluding completed folder)
     all_txt_files = list(TEXT_INPUT_DIR.glob('*.txt'))
     
-    # Get list of already processed files (both completed and failed)
+    # Get list of already processed files (only completed files, not failed if retry is enabled)
     processed_files = set()
     
-    # Check completed files
+    # Check completed files (recursively search in date subfolders)
     if COMPLETED_DIR.exists():
-        for f in COMPLETED_DIR.glob('*.txt'):
+        for f in COMPLETED_DIR.rglob('*.txt'):  # rglob searches recursively
             processed_files.add(f.name)
             # Also handle timestamped files (remove timestamp suffix)
             name_parts = f.stem.split('_')
@@ -792,25 +921,28 @@ def main():
                 original_name = '_'.join(name_parts[:-1]) + f.suffix
                 processed_files.add(original_name)
     
-    # Check failed files
-    if FAILED_DIR.exists():
-        for f in FAILED_DIR.glob('*.txt'):
-            processed_files.add(f.name)
-            # Also handle timestamped files (remove timestamp suffix)
-            name_parts = f.stem.split('_')
-            if len(name_parts) > 1 and name_parts[-1].isdigit():
-                original_name = '_'.join(name_parts[:-1]) + f.suffix
-                processed_files.add(original_name)
+    # Only exclude failed files if retry_failed is False
+    if not retry_failed:
+        if FAILED_DIR.exists():
+            for f in FAILED_DIR.glob('*.txt'):
+                processed_files.add(f.name)
+                # Also handle timestamped files (remove timestamp suffix)
+                name_parts = f.stem.split('_')
+                if len(name_parts) > 1 and name_parts[-1].isdigit():
+                    original_name = '_'.join(name_parts[:-1]) + f.suffix
+                    processed_files.add(original_name)
     
     # Filter out already processed files
     text_files = [f for f in all_txt_files if f.name not in processed_files]
     
-    completed_count = len(list(COMPLETED_DIR.glob('*.txt'))) if COMPLETED_DIR.exists() else 0
+    completed_count = len(list(COMPLETED_DIR.rglob('*.txt'))) if COMPLETED_DIR.exists() else 0
     failed_count = len(list(FAILED_DIR.glob('*.txt'))) if FAILED_DIR.exists() else 0
     
     print(f"Found {len(all_txt_files)} total .txt files")
     print(f"  - {completed_count} previously completed successfully")
     print(f"  - {failed_count} previously failed")
+    if retry_failed:
+        print(f"  - Retry mode: Will retry failed files")
     print(f"Processing {len(text_files)} remaining files")
     if not text_files:
         print(f"No .txt files found in '{TEXT_INPUT_DIR}'.")
@@ -829,13 +961,19 @@ def main():
         print(f"\nProcessing text file {i}/{len(text_files)}: {txt_file_path.name}")
         logging.info(f"\nProcessing text file {i}/{len(text_files)}: {txt_file_path.name}")
         original_filename = txt_file_path.stem # Assumes .txt was added to original PDF stem
+        
+        # Collect rows for this file
+        file_rows = []
 
         permit_text_content = read_text_from_file(txt_file_path)
         if not permit_text_content:
             logging.warning(f"  Skipping file {original_filename} due to text reading error or empty content.")
-            processed_data_rows.append({"Filename": original_filename, "Status": "Text Reading Failed", **{field: "ERROR" for field in ALL_OUTPUT_FIELDS}})
+            file_rows.append({"Filename": original_filename, "Status": "Text Reading Failed", **{field: "ERROR" for field in ALL_OUTPUT_FIELDS}})
             # Move file to failed folder - failed to read
             move_processed_file(txt_file_path, success=False)
+            # Save immediately
+            append_rows_to_excel(file_rows)
+            processed_data_rows.extend(file_rows)
             continue
 
         # MAX_CHARS check can still be useful here if there's a concern about LLM input limits
@@ -863,14 +1001,14 @@ def main():
                         row_data.update(general_info)
                         for field in UNIT_DETAIL_FIELDS:
                             row_data[field] = unit.get(field)
-                        processed_data_rows.append(row_data)
+                        file_rows.append(row_data)
                     else:
                         logging.warning(f"  Skipping invalid unit entry (not a dict) in {original_filename}: {unit}")
                         # ... (malformed unit data logging as before)
                         row_data = {"Filename": original_filename, "Status": "Malformed Unit Data"}
                         row_data.update(general_info)
                         for field in UNIT_DETAIL_FIELDS: row_data[field] = "INVALID UNIT ENTRY"
-                        processed_data_rows.append(row_data)
+                        file_rows.append(row_data)
                 
                 # Move file to completed folder - successful extraction with units
                 move_processed_file(txt_file_path, success=True)
@@ -881,42 +1019,54 @@ def main():
                 row_data = {"Filename": original_filename, "Status": "Success (No Units Found)"}
                 row_data.update(general_info)
                 for field in UNIT_DETAIL_FIELDS: row_data[field] = None
-                processed_data_rows.append(row_data)
+                file_rows.append(row_data)
                 
                 # Move file to completed folder - successful extraction but no units
                 move_processed_file(txt_file_path, success=True)
         else:
             logging.error(f"  Failed to extract information from {original_filename} (LLM call returned None or invalid data).")
             # ... (LLM extraction failed logging as before)
-            processed_data_rows.append({"Filename": original_filename, "Status": "LLM Extraction Failed", **{field: "ERROR" for field in ALL_OUTPUT_FIELDS}})
+            file_rows.append({"Filename": original_filename, "Status": "LLM Extraction Failed", **{field: "ERROR" for field in ALL_OUTPUT_FIELDS}})
             
             # Move file to failed folder - failed extraction
             move_processed_file(txt_file_path, success=False)
+        
+        # Save rows for this file immediately to prevent data loss
+        if file_rows:
+            append_rows_to_excel(file_rows)
+            processed_data_rows.extend(file_rows)
+            print(f"  ✓ Saved {len(file_rows)} row(s) to Excel")
 
 
-    # Save to Excel and add spec sheet links
-    if processed_data_rows:
-        logging.info(f"\nSaving extracted data to {OUTPUT_EXCEL_FILE}...")
+    # Add spec sheet links if enabled (rows are already saved incrementally)
+    if processed_data_rows and ENABLE_SPEC_SHEET_LOOKUP:
+        logging.info(f"\nAdding spec sheet links to existing Excel file...")
         try:
-            df = pd.DataFrame(processed_data_rows)
-            excel_columns = ["Filename", "Status"] + ALL_OUTPUT_FIELDS
-            for col in excel_columns:
-                if col not in df.columns:
-                    df[col] = None
-            df = df[excel_columns]
-            
-            # Add spec sheet links for rows with make and model data
-            logging.info("\nAdding spec sheet links for equipment with make and model information...")
-            df = add_spec_sheet_links(df, llm_client)
-            
-            # Add the spec sheet link column to the final output
-            excel_columns_with_spec = excel_columns + ["Spec Sheet Link"]
-            df = df[excel_columns_with_spec]
-            
-            df.to_excel(OUTPUT_EXCEL_FILE, index=False, engine='openpyxl')
-            logging.info(f"Data successfully saved to '{OUTPUT_EXCEL_FILE}' with spec sheet links.")
+            # Read the existing Excel file
+            if os.path.exists(OUTPUT_EXCEL_FILE):
+                df = pd.read_excel(OUTPUT_EXCEL_FILE, engine='openpyxl')
+                
+                # Add spec sheet links for rows with make and model data
+                logging.info("Adding spec sheet links for equipment with make and model information...")
+                df = add_spec_sheet_links(df, llm_client)
+                
+                # Ensure all columns are in the right order
+                excel_columns = ["Filename", "Status", "Processing Date", "Model Used"] + ALL_OUTPUT_FIELDS + ["Spec Sheet Link"]
+                for col in excel_columns:
+                    if col not in df.columns:
+                        df[col] = None
+                df = df[excel_columns]
+                
+                # Save updated file with spec sheet links
+                df.to_excel(OUTPUT_EXCEL_FILE, index=False, engine='openpyxl')
+                logging.info(f"Successfully added spec sheet links to '{OUTPUT_EXCEL_FILE}'.")
+            else:
+                logging.warning("Excel file not found for spec sheet link addition.")
         except Exception as e:
-            logging.error(f"Error saving data to Excel: {e}", exc_info=True)
+            logging.error(f"Error adding spec sheet links to Excel: {e}", exc_info=True)
+    elif processed_data_rows:
+        print(f"\nProcessed {len(processed_data_rows)} row(s) (saved incrementally)")
+        logging.info(f"Processed {len(processed_data_rows)} row(s) (saved incrementally)")
     else:
         print("No data was processed to save.")
         logging.warning("No data was processed to save.")
@@ -933,6 +1083,11 @@ def add_spec_sheets():
     """Add spec sheet links to an existing Excel file."""
     print("Adding spec sheet links to existing Excel file...")
     logging.info("Starting spec sheet link addition process...")
+
+    if not ENABLE_SPEC_SHEET_LOOKUP:
+        print("Spec sheet lookup is currently disabled. Enable ENABLE_SPEC_SHEET_LOOKUP to use this command.")
+        logging.info("Spec sheet lookup disabled; exiting without changes.")
+        return
     
     # Configure LLM client for analysis
     llm_client = configure_llm()
