@@ -5,6 +5,18 @@
 # Test results
 /test_results/
 
+# Process logs
+nohup.out
+
+# Generated HTML output
+*.html
+
+# Temporary CSV files
+temp_*.csv
+
+# Personal shell config
+.zshrc
+
 # Mac OS-specific storage files
 .DS_Store
 
@@ -190,3 +202,12 @@ cython_debug/
 .pypirc
 presentation_outline.md
 reports/figures/facilities_map_all_air.png
+PRESENTATION_SUMMARY.md
+notebooks/presentation_visualizations_executed.ipynb
+notebooks/presentation_visualizations.ipynb
+presentation/POC_Presentation_Guide.md
+presentation/presentation_metrics.json
+presentation/presentation_notes.md
+presentation/QUICK_START.md
+presentation/README.md
+presentation/sample_extractions.md

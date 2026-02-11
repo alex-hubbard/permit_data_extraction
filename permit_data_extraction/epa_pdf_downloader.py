@@ -1,42 +1,46 @@
 #!/usr/bin/env python3
 """
-EPA Permit PDF Downloader
+EPA Permit PDF Downloader (Version 2)
 
-This script downloads Final Permit PDFs from EPA permit hub pages.
-It looks for the "Permitting Authority Documents" table and downloads
-the "Final Permit" document.
+This script downloads Final Permit PDFs from EPA permit hub pages by using
+Selenium to click download buttons.
 
-This uses Selenium because the EPA permit hub is a JavaScript-rendered SPA.
+The EPA permit hub is a JavaScript SPA, so we need Selenium to:
+1. Load and render the page
+2. Find the "Final Permit" row in the "Permitting Authority Documents" table
+3. Click the download button
+4. Wait for and manage the download
 """
 
-import requests
-from bs4 import BeautifulSoup
 import pandas as pd
 import os
 import time
 import re
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
 import json
+import glob
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 from permit_data_extraction.config import RAW_DATA_DIR
 
 
 class EPAPermitPDFDownloader:
-    def __init__(self, output_dir=None, delay_seconds=2, headless=True):
+    def __init__(self, output_dir=None, delay_seconds=2, headless=True, temp_download_dir=None):
         """
         Initialize the EPA Permit PDF Downloader.
         
         Args:
             output_dir (str): Directory where PDFs will be saved
-            delay_seconds (int): Delay between requests to be respectful to EPA servers
+            delay_seconds (int): Delay between requests
             headless (bool): Run Chrome in headless mode
+            temp_download_dir (str): Optional temp download directory for Chrome
         """
         if output_dir is None:
             self.output_dir = Path(RAW_DATA_DIR) / "epa_final_permits"
@@ -47,34 +51,52 @@ class EPAPermitPDFDownloader:
         self.delay_seconds = delay_seconds
         self.headless = headless
         
-        # Session for downloading PDFs
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
+        # Temp download directory for Chrome
+        self.download_dir = Path(temp_download_dir) if temp_download_dir else self.output_dir / "_temp_downloads"
+        self.download_dir.mkdir(exist_ok=True)
+        
+        # File to track completed links
+        self.completed_links_file = self.output_dir / "completed_links.txt"
+        self.completed_links_lock = threading.Lock()
         
         # Initialize Selenium driver
         self.driver = None
         self._setup_driver()
     
     def _setup_driver(self):
-        """Setup Selenium Chrome driver."""
-        import tempfile
-        
+        """Setup Selenium Chrome driver with download preferences."""
         chrome_options = Options()
+        
         if self.headless:
             chrome_options.add_argument('--headless=new')
+        
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-gpu')
         chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
         
-        # Use a unique temporary user data directory
-        temp_dir = tempfile.mkdtemp(prefix='chrome_user_data_')
-        chrome_options.add_argument(f'--user-data-dir={temp_dir}')
+        # Configure download behavior
+        prefs = {
+            "download.default_directory": str(self.download_dir.absolute()),
+            "download.prompt_for_download": False,
+            "download.directory_upgrade": True,
+            "safebrowsing.enabled": False,
+            "safebrowsing.disable_download_protection": True,
+            "profile.default_content_setting_values.automatic_downloads": 1
+        }
+        chrome_options.add_experimental_option("prefs", prefs)
         
         self.driver = webdriver.Chrome(options=chrome_options)
+
+    def _wait_for_tables(self, min_tables=2, timeout=20):
+        """Wait until the expected number of tables are present."""
+        try:
+            WebDriverWait(self.driver, timeout).until(
+                lambda d: len(d.find_elements(By.TAG_NAME, 'table')) >= min_tables
+            )
+            return True
+        except TimeoutException:
+            return False
     
     def __del__(self):
         """Cleanup Selenium driver."""
@@ -84,171 +106,219 @@ class EPAPermitPDFDownloader:
             except:
                 pass
     
-    def clean_filename(self, filename):
-        """
-        Clean the filename by removing invalid characters.
-        
-        Args:
-            filename (str): The filename to clean
-        
-        Returns:
-            str: Cleaned filename
-        """
-        # Remove invalid characters
-        filename = re.sub(r'[<>:"/\\|?*]', '', filename)
-        # Replace multiple spaces with single space
-        filename = re.sub(r'\s+', '_', filename)
-        # Strip leading/trailing spaces and underscores
-        filename = filename.strip('_ ')
-        return filename
-    
-    def find_and_download_final_permit(self, permit_url, output_filepath):
-        """
-        Find and download the Final Permit PDF by clicking the download button.
-        Uses Selenium to render JavaScript and click the download button.
-        
-        Args:
-            permit_url (str): The URL of the permit page
-            output_filepath (str): Where to save the downloaded file
-        
-        Returns:
-            dict: Dictionary with download info or None if not found
-        """
-        try:
-            # Configure Chrome to download to a specific directory
-            download_dir = str(Path(output_filepath).parent.absolute())
-            
-            # Setup Chrome preferences for downloads
-            prefs = {
-                "download.default_directory": download_dir,
-                "download.prompt_for_download": False,
-                "download.directory_upgrade": True,
-                "safebrowsing.enabled": True
-            }
-            
-            # Note: We'll handle downloads differently - see below
-            
-            # Load the page
-            self.driver.get(permit_url)
-            
-            # Wait for page to load and JavaScript to render
-            time.sleep(5)
-            
-            # Try to find the Final Permit row and download button
+    def _load_completed_links(self):
+        """Load completed links from file."""
+        completed_links = set()
+        if self.completed_links_file.exists():
             try:
-                # Use XPath to find table cell containing "Final Permit"
-                # Then find the download button in the same row
-                final_permit_xpath = "//td[contains(text(), 'Final Permit')]/following-sibling::td//button[contains(@title, 'Download')]"
-                
-                download_button = self.driver.find_element(By.XPATH, final_permit_xpath)
-                
-                if download_button:
-                    # Get the filename from the title attribute
-                    title = download_button.get_attribute('title')
-                    # Title is like "Download A530001F_3_00.pdf 3789kb"
-                    if title and 'Download ' in title:
-                        filename = title.replace('Download ', '').split()[0]  # Get just the filename
-                        
-                        # Click the button - this will trigger a download
-                        # But we need to intercept the actual download URL
-                        # Let's try to find it in the button's onclick or parent elements
-                        
-                        # Alternative: Look for the actual download URL in network requests
-                        # For now, let's try clicking and see what happens
-                        download_button.click()
-                        
-                        # Wait a bit for download to start
-                        time.sleep(2)
-                        
-                        return {
-                            'filename': filename,
-                            'method': 'button_click',
-                            'document_type': 'Final Permit'
-                        }
-                
-            except NoSuchElementException:
-                print(f"  Could not find Final Permit download button")
+                with open(self.completed_links_file, 'r') as f:
+                    for line in f:
+                        url = line.strip()
+                        if url:
+                            completed_links.add(url)
             except Exception as e:
-                print(f"  Error finding/clicking download button: {e}")
-            
-            # Fallback: Try to construct the download URL from the filename
-            # The EPA permit hub likely has a consistent API endpoint for downloads
-            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-            tables = soup.find_all('table')
-            
-            for table in tables:
-                rows = table.find_all('tr')
-                for row in rows:
-                    cells = row.find_all(['td', 'th'])
-                    row_text = ' '.join([cell.get_text().strip() for cell in cells])
-                    
-                    if 'Final Permit' in row_text:
-                        # Found the row, try to extract filename
-                        for cell in cells:
-                            cell_text = cell.get_text().strip()
-                            if '.pdf' in cell_text:
-                                # This might be the filename
-                                return {
-                                    'filename': cell_text,
-                                    'method': 'extracted_from_table',
-                                    'document_type': 'Final Permit'
-                                }
-            
-        except Exception as e:
-            print(f"  Error in find_and_download_final_permit: {e}")
-        
-        return None
+                print(f"Warning: Could not read completed links file: {e}")
+        return completed_links
     
-    def _extract_final_permit_from_table(self, table, page_url):
-        """
-        Extract Final Permit link from a table.
+    def _is_link_completed(self, url):
+        """Check if a link has already been completed."""
+        if not url:
+            return False
+        with self.completed_links_lock:
+            completed_links = self._load_completed_links()
+            return url in completed_links
+    
+    def _mark_link_completed(self, url):
+        """Mark a link as completed (thread-safe)."""
+        if not url:
+            return
+        with self.completed_links_lock:
+            # Check again to avoid duplicates
+            completed_links = self._load_completed_links()
+            if url not in completed_links:
+                try:
+                    with open(self.completed_links_file, 'a') as f:
+                        f.write(url + '\n')
+                except Exception as e:
+                    print(f"Warning: Could not write to completed links file: {e}")
+
+    def _download_from_button(self, download_button, state_code=None, permit_id=None):
+        """Click a download button and move the downloaded file into place."""
+        # Get the filename from button title
+        title = download_button.get_attribute('title')
+        button_text = download_button.text
+        filename = None
+        # Title format: "Download A530001F_3_00.pdf 3789kb" or "Download all files"
+        if title and 'Download ' in title:
+            # Extract filename if it's a specific file download
+            title_parts = title.replace('Download ', '').split()
+            if title_parts and '.' in title_parts[0]:
+                filename = title_parts[0]
         
-        Args:
-            table (BeautifulSoup): Table element to search
-            page_url (str): The URL of the current page
+        # Clear download directory before downloading
+        for f in self.download_dir.glob('*'):
+            if f.is_file():
+                f.unlink()
         
-        Returns:
-            dict: Dictionary with link info or None if not found
-        """
-        rows = table.find_all('tr')
+        # Click the download button
+        download_button.click()
         
-        for row in rows:
-            # Get all cells in the row
-            cells = row.find_all(['td', 'th'])
+        # Wait for download to complete
+        max_wait = 60  # seconds (longer for "Download all" which might be a ZIP)
+        downloaded_file = None
+        
+        for _ in range(max_wait):
+            time.sleep(1)
             
-            # Look for a cell that contains "Final Permit"
-            for cell in cells:
-                cell_text = cell.get_text().strip().lower()
-                
-                if 'final permit' in cell_text:
-                    # Found the row with Final Permit, now find the download link
-                    # It might be in the same cell or another cell in the row
-                    
-                    # First check the same cell
-                    link = cell.find('a', href=True)
-                    if link:
-                        full_url = urljoin(page_url, link['href'])
-                        return {
-                            'url': full_url,
-                            'text': link.get_text().strip(),
-                            'document_type': 'Final Permit'
-                        }
-                    
-                    # Check other cells in the row
-                    for other_cell in cells:
-                        link = other_cell.find('a', href=True)
-                        if link:
-                            # Prefer links that look like downloads
-                            href = link.get('href', '')
-                            if any(ext in href.lower() for ext in ['.pdf', '.doc', '.docx', 'download']):
-                                full_url = urljoin(page_url, link['href'])
-                                return {
-                                    'url': full_url,
-                                    'text': link.get_text().strip(),
-                                    'document_type': 'Final Permit'
-                                }
+            # Check for downloaded files (PDF or ZIP)
+            downloaded_files = list(self.download_dir.glob('*.pdf'))
+            downloaded_files.extend(self.download_dir.glob('*.zip'))
+            
+            # Also check for .crdownload files (in-progress downloads)
+            in_progress = list(self.download_dir.glob('*.crdownload'))
+            
+            if downloaded_files and not in_progress:
+                downloaded_file = downloaded_files[0]
+                break
         
-        return None
+        if not downloaded_file:
+            return {
+                'status': 'failed',
+                'filename': filename,
+                'pdf_path': None,
+                'error': 'Download timeout or failed'
+            }
+        
+        # Determine final filename
+        if not filename:
+            filename = downloaded_file.name
+        
+        # If this looks like a "Download all" (ZIP file) and we have permit_id, create a better name
+        if downloaded_file.suffix.lower() == '.zip' and permit_id:
+            # Create a name like: STATE_PERMITID_all_files.zip
+            if state_code:
+                filename = f"{state_code}_{permit_id}_all_files.zip"
+            else:
+                filename = f"{permit_id}_all_files.zip"
+        
+        # Move file to final location with proper naming
+        if state_code:
+            state_dir = self.output_dir / state_code
+            state_dir.mkdir(exist_ok=True)
+            final_path = state_dir / filename
+        else:
+            final_path = self.output_dir / filename
+        
+        # Check if file already exists
+        if final_path.exists():
+            downloaded_file.unlink()  # Delete temp file
+            return {
+                'status': 'already_exists',
+                'filename': filename,
+                'pdf_path': str(final_path),
+                'error': None
+            }
+        
+        # Move to final location
+        downloaded_file.rename(final_path)
+        
+        return {
+            'status': 'success',
+            'filename': filename,
+            'pdf_path': str(final_path),
+            'error': None
+        }
+
+    def _process_dataframe(self, df, downloaded_urls, downloaded_lock):
+        """Process a dataframe chunk and return results."""
+        results = {
+            'total_processed': 0,
+            'successful': 0,
+            'already_exists': 0,
+            'already_downloaded': 0,
+            'failed': 0,
+            'details': []
+        }
+        
+        for idx, row in df.iterrows():
+            url = row.get('url')
+            permit_id = row.get('permit_id', '')
+            state_code = row.get('state_code', '')
+            
+            print(f"\n[{idx + 1}] Processing: {state_code} - {permit_id}")
+            print(f"  URL: {url}")
+            
+            # Check completed links file first (most reliable)
+            if self._is_link_completed(url):
+                result = {
+                    'permit_url': url,
+                    'permit_id': permit_id,
+                    'state_code': state_code,
+                    'status': 'already_downloaded',
+                    'filename': None,
+                    'pdf_path': None,
+                    'error': None
+                }
+                results['total_processed'] += 1
+                results['already_downloaded'] += 1
+                results['details'].append(result)
+                print("  ⊙ Already completed (skipping - found in completed_links.txt)")
+                continue
+            
+            # Also check in-memory set (for this run)
+            with downloaded_lock:
+                already_downloaded = url in downloaded_urls
+            
+            if already_downloaded:
+                result = {
+                    'permit_url': url,
+                    'permit_id': permit_id,
+                    'state_code': state_code,
+                    'status': 'already_downloaded',
+                    'filename': None,
+                    'pdf_path': None,
+                    'error': None
+                }
+                results['total_processed'] += 1
+                results['already_downloaded'] += 1
+                results['details'].append(result)
+                print("  ⊙ Already downloaded (skipping URL - this run)")
+                continue
+            
+            # Download the permit
+            result = self.download_permit_pdf(url, permit_id, state_code)
+            
+            results['total_processed'] += 1
+            
+            if result['status'] == 'success':
+                results['successful'] += 1
+                print(f"  ✓ Downloaded: {result['pdf_path']}")
+                # Mark as completed in file
+                self._mark_link_completed(url)
+                if url:
+                    with downloaded_lock:
+                        downloaded_urls.add(url)
+            elif result['status'] == 'already_exists':
+                results['already_exists'] += 1
+                print(f"  ⊙ Already exists: {result['pdf_path']}")
+                # Mark as completed in file (file exists, so it's effectively completed)
+                self._mark_link_completed(url)
+                if url:
+                    with downloaded_lock:
+                        downloaded_urls.add(url)
+            elif result['status'] == 'already_downloaded':
+                results['already_downloaded'] += 1
+                print("  ⊙ Already downloaded (skipping URL)")
+            else:
+                results['failed'] += 1
+                print(f"  ✗ Failed: {result['error']}")
+            
+            results['details'].append(result)
+            
+            # Delay between requests
+            time.sleep(self.delay_seconds)
+        
+        return results
     
     def download_permit_pdf(self, permit_url, permit_id, state_code=None):
         """
@@ -267,84 +337,113 @@ class EPAPermitPDFDownloader:
             'permit_id': permit_id,
             'state_code': state_code,
             'status': 'failed',
-            'pdf_url': None,
+            'filename': None,
             'pdf_path': None,
             'error': None
         }
         
         try:
-            # Find the Final Permit link using Selenium
-            permit_link = self.find_final_permit_link(permit_url)
+            # Load the page
+            self.driver.get(permit_url)
             
-            if not permit_link:
-                result['error'] = 'Final Permit link not found'
+            # Wait for the permit details content to render
+            print("  Waiting for page content to load...")
+            tables_found = self._wait_for_tables(min_tables=2, timeout=20)
+            
+            if not tables_found:
+                result['error'] = 'Page content did not load (Angular rendering issue)'
                 return result
             
-            result['pdf_url'] = permit_link['url']
-            
-            # Download the PDF
-            pdf_response = self.session.get(permit_link['url'], timeout=30)
-            pdf_response.raise_for_status()
-            
-            # Determine filename
-            # Try to get from Content-Disposition header
-            filename = None
-            content_disposition = pdf_response.headers.get('content-disposition')
-            if content_disposition:
-                filename_match = re.findall(r'filename[^;=\n]*=(([\'"]).*?\2|[^;\n]*)', content_disposition)
-                if filename_match:
-                    filename = filename_match[0][0].strip('"\'')
-            
-            # If no filename from header, create one
-            if not filename:
-                # Get file extension from URL or content-type
-                file_ext = os.path.splitext(urlparse(permit_link['url']).path)[1]
-                if not file_ext:
-                    content_type = pdf_response.headers.get('content-type', '').lower()
-                    if 'pdf' in content_type:
-                        file_ext = '.pdf'
-                    elif 'word' in content_type or 'msword' in content_type:
-                        file_ext = '.doc'
-                    else:
-                        file_ext = '.pdf'  # default
+            # First, try to find a "Download all files" button
+            try:
+                # Look for buttons with text/title containing "all" and "download" (case-insensitive)
+                # Try various XPath patterns to find the "Download all" button
+                download_all_patterns = [
+                    "//button[contains(translate(@title, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download') and contains(translate(@title, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'all')]",
+                    "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download') and contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'all')]",
+                    "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download all')]",
+                    "//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download all')]",
+                ]
                 
-                # Create filename from permit_id
-                filename = f"{state_code}_{permit_id}{file_ext}" if state_code else f"{permit_id}{file_ext}"
-            
-            # Clean the filename
-            filename = self.clean_filename(filename)
-            
-            # Create state subdirectory if state_code provided
-            if state_code:
-                state_dir = self.output_dir / state_code
-                state_dir.mkdir(exist_ok=True)
-                filepath = state_dir / filename
-            else:
-                filepath = self.output_dir / filename
-            
-            # Check if file already exists
-            if filepath.exists():
-                result['status'] = 'already_exists'
-                result['pdf_path'] = str(filepath)
-                return result
-            
-            # Save the PDF
-            with open(filepath, 'wb') as f:
-                for chunk in pdf_response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            
-            result['status'] = 'success'
-            result['pdf_path'] = str(filepath)
-            
-        except requests.exceptions.RequestException as e:
-            result['error'] = f"Request error: {str(e)}"
+                download_all_button = None
+                for pattern in download_all_patterns:
+                    buttons = self.driver.find_elements(By.XPATH, pattern)
+                    if buttons:
+                        download_all_button = buttons[0]
+                        break
+                
+                if download_all_button:
+                    # Use "Download all files" button
+                    print("  Found 'Download all files' button, using it...")
+                    download_result = self._download_from_button(download_all_button, state_code=state_code, permit_id=permit_id)
+                    
+                    result['status'] = download_result['status']
+                    result['filename'] = download_result.get('filename')
+                    result['pdf_path'] = download_result.get('pdf_path')
+                    result['download_mode'] = 'download_all_button'
+                    
+                    if download_result.get('error'):
+                        result['error'] = download_result['error']
+                    
+                    return result
+                
+                # Fallback: Find "Permit" labeled documents; if none, download all documents
+                print("  'Download all files' button not found, downloading individual documents...")
+                permit_buttons_xpath = (
+                    "//tr[.//td[contains("
+                    "translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'),"
+                    " 'permit')]]"
+                    "//button[contains(@title, 'Download')]"
+                )
+                download_buttons = self.driver.find_elements(By.XPATH, permit_buttons_xpath)
+                mode = 'permit_labeled'
+                
+                if not download_buttons:
+                    download_buttons = self.driver.find_elements(
+                        By.XPATH,
+                        "//button[contains(@title, 'Download')]"
+                    )
+                    mode = 'all_documents'
+                
+                if not download_buttons:
+                    result['error'] = 'No download buttons found'
+                    return result
+                
+                downloaded_paths = []
+                filenames = []
+                errors = []
+                
+                for button in download_buttons:
+                    download_result = self._download_from_button(button, state_code=state_code)
+                    if download_result.get('filename'):
+                        filenames.append(download_result['filename'])
+                    if download_result.get('pdf_path'):
+                        downloaded_paths.append(download_result['pdf_path'])
+                    
+                    if download_result['status'] == 'success':
+                        result['status'] = 'success'
+                    elif download_result['status'] == 'already_exists' and result['status'] != 'success':
+                        result['status'] = 'already_exists'
+                    else:
+                        errors.append(download_result.get('error'))
+                
+                result['filename'] = filenames[0] if filenames else None
+                result['pdf_path'] = downloaded_paths[0] if downloaded_paths else None
+                result['pdf_paths'] = downloaded_paths
+                result['download_mode'] = mode
+                
+                if result['status'] == 'failed' and errors:
+                    result['error'] = '; '.join([e for e in errors if e])
+                
+            except Exception as e:
+                result['error'] = f'Error finding/clicking download button(s): {str(e)}'
+        
         except Exception as e:
             result['error'] = f"Unexpected error: {str(e)}"
         
         return result
     
-    def download_from_csv(self, csv_path, max_permits=None, resume_from=0):
+    def download_from_csv(self, csv_path, max_permits=None, resume_from=0, workers=1):
         """
         Download Final Permit PDFs from URLs in a CSV file.
         
@@ -352,6 +451,7 @@ class EPAPermitPDFDownloader:
             csv_path (str): Path to CSV file with permit URLs
             max_permits (int): Maximum number of permits to download (None for all)
             resume_from (int): Row index to resume from (0-based)
+            workers (int): Number of parallel workers
         
         Returns:
             dict: Summary of download results
@@ -369,44 +469,79 @@ class EPAPermitPDFDownloader:
         else:
             df = df.iloc[resume_from:]
         
+        # Load completed links from persistent file
+        completed_links = self._load_completed_links()
+        print(f"Loaded {len(completed_links)} completed links from {self.completed_links_file.name}")
+        
+        # Also seed already-downloaded URLs from prior summary if available (for backward compatibility)
+        summary_file = self.output_dir / "download_summary.json"
+        downloaded_urls = set(completed_links)  # Start with completed links
+        if summary_file.exists():
+            try:
+                with open(summary_file, 'r') as f:
+                    previous_results = json.load(f)
+                for detail in previous_results.get('details', []):
+                    if detail.get('status') in {'success', 'already_exists', 'already_downloaded'}:
+                        url = detail.get('permit_url')
+                        if url:
+                            downloaded_urls.add(url)
+                additional_from_summary = len(downloaded_urls) - len(completed_links)
+                if additional_from_summary > 0:
+                    print(f"  Also found {additional_from_summary} additional URLs in download_summary.json")
+            except Exception:
+                print("Warning: Could not read existing download summary; using completed_links.txt only.")
+        
         # Results tracking
         results = {
             'total_processed': 0,
             'successful': 0,
             'already_exists': 0,
+            'already_downloaded': 0,
             'failed': 0,
             'details': []
         }
         
-        # Process each permit
-        for idx, row in df.iterrows():
-            url = row.get('url')
-            permit_id = row.get('permit_id', '')
-            state_code = row.get('state_code', '')
+        downloaded_lock = threading.Lock()
+        
+        if workers <= 1 or len(df) <= 1:
+            results = self._process_dataframe(df, downloaded_urls, downloaded_lock)
+        else:
+            # Split dataframe into chunks for workers
+            chunk_size = max(1, len(df) // workers)
+            chunks = [
+                df.iloc[i:i + chunk_size]
+                for i in range(0, len(df), chunk_size)
+            ]
             
-            print(f"\n[{idx + 1}/{len(df) + resume_from}] Processing: {state_code} - {permit_id}")
-            print(f"  URL: {url}")
-            
-            # Download the permit
-            result = self.download_permit_pdf(url, permit_id, state_code)
-            
-            results['total_processed'] += 1
-            
-            if result['status'] == 'success':
-                results['successful'] += 1
-                print(f"  ✓ Downloaded: {result['pdf_path']}")
-            elif result['status'] == 'already_exists':
-                results['already_exists'] += 1
-                print(f"  ⊙ Already exists: {result['pdf_path']}")
-            else:
-                results['failed'] += 1
-                print(f"  ✗ Failed: {result['error']}")
-            
-            results['details'].append(result)
-            
-            # Delay between requests
-            if idx < len(df) - 1:
-                time.sleep(self.delay_seconds)
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = []
+                for worker_id, chunk in enumerate(chunks, start=1):
+                    temp_dir = str(self.output_dir / f"_temp_downloads_{worker_id}")
+                    def _worker(local_chunk=chunk, local_id=worker_id, local_temp=temp_dir):
+                        worker = EPAPermitPDFDownloader(
+                            output_dir=str(self.output_dir),
+                            delay_seconds=self.delay_seconds,
+                            headless=self.headless,
+                            temp_download_dir=local_temp
+                        )
+                        try:
+                            return worker._process_dataframe(local_chunk, downloaded_urls, downloaded_lock)
+                        finally:
+                            try:
+                                worker.driver.quit()
+                            except Exception:
+                                pass
+                    
+                    futures.append(executor.submit(_worker))
+                
+                for future in as_completed(futures):
+                    chunk_results = future.result()
+                    results['total_processed'] += chunk_results['total_processed']
+                    results['successful'] += chunk_results['successful']
+                    results['already_exists'] += chunk_results['already_exists']
+                    results['already_downloaded'] += chunk_results['already_downloaded']
+                    results['failed'] += chunk_results['failed']
+                    results['details'].extend(chunk_results['details'])
         
         # Save results summary
         summary_file = self.output_dir / "download_summary.json"
@@ -420,8 +555,10 @@ class EPAPermitPDFDownloader:
         print(f"Total processed: {results['total_processed']}")
         print(f"Successfully downloaded: {results['successful']}")
         print(f"Already existed: {results['already_exists']}")
+        print(f"Already downloaded (skipped): {results['already_downloaded']}")
         print(f"Failed: {results['failed']}")
         print(f"\nOutput directory: {self.output_dir}")
+        print(f"Completed links tracked in: {self.completed_links_file}")
         print(f"Summary saved to: {summary_file}")
         
         return results
@@ -467,6 +604,12 @@ def main():
         help='Run Chrome in visible mode (not headless)',
         default=False
     )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        help='Number of parallel workers (default: 1)',
+        default=1
+    )
     
     args = parser.parse_args()
     
@@ -481,7 +624,8 @@ def main():
     downloader.download_from_csv(
         args.csv_path,
         max_permits=args.max_permits,
-        resume_from=args.resume_from
+        resume_from=args.resume_from,
+        workers=args.workers
     )
 
 
