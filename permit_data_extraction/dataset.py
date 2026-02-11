@@ -5,7 +5,9 @@ import time  # To add delays between API calls if needed
 import re
 import shutil
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import quote_plus
 
 import openai
@@ -36,11 +38,17 @@ FAILED_DIR = TEXT_INPUT_DIR / 'failed'
 OUTPUT_EXCEL_FILE = os.path.join(PROCESSED_DATA_DIR,
                                  'permit_data_extracted.xlsx')
 
+# Save tuning
+SAVE_EVERY_N_FILES = 10  # Reduce Excel IO by batching writes
+# LLM concurrency tuning
+LLM_MAX_WORKERS = 3  # Keep low to avoid rate limits
+
 # Feature flags
 ENABLE_SPEC_SHEET_LOOKUP = False
 
 # LLM model configuration
-LLM_MODEL = "lbl/llama"
+LLM_MODEL = "lbl/cborg-deepthought"
+LLM_LARGE_MODEL = os.getenv("LLM_LARGE_MODEL", "lbl/llama-70b")
 
 # General permit info
 GENERAL_TARGET_FIELDS = [
@@ -267,17 +275,12 @@ def append_rows_to_excel(new_rows, llm_client=None):
         # Check if Excel file exists
         if os.path.exists(OUTPUT_EXCEL_FILE):
             # Read existing file
-            existing_df = pd.read_excel(OUTPUT_EXCEL_FILE, engine='openpyxl')
-            
-            # Ensure existing file has all columns
-            for col in excel_columns:
-                if col not in existing_df.columns:
-                    existing_df[col] = None
-            
-            # Remove any rows that match the new rows (by Filename) to avoid duplicates when retrying
-            # This handles the case where we're retrying failed files
-            filenames_to_update = set(new_df['Filename'].unique())
-            existing_df = existing_df[~existing_df['Filename'].isin(filenames_to_update)]
+            existing_df = load_existing_excel(excel_columns)
+            if not existing_df.empty:
+                # Remove any rows that match the new rows (by Filename) to avoid duplicates when retrying
+                # This handles the case where we're retrying failed files
+                filenames_to_update = set(new_df['Filename'].unique())
+                existing_df = existing_df[~existing_df['Filename'].isin(filenames_to_update)]
             
             # Combine existing and new data
             combined_df = pd.concat([existing_df, new_df], ignore_index=True)
@@ -292,6 +295,204 @@ def append_rows_to_excel(new_rows, llm_client=None):
     except Exception as e:
         logging.error(f"Error appending rows to Excel: {e}", exc_info=True)
         print(f"  Warning: Failed to save rows to Excel: {e}")
+
+
+def load_existing_excel(excel_columns):
+    """Load existing Excel data once to avoid repeated IO."""
+    if os.path.exists(OUTPUT_EXCEL_FILE):
+        try:
+            existing_df = pd.read_excel(OUTPUT_EXCEL_FILE, engine="openpyxl")
+        except Exception as e:
+            logging.error(f"Failed to read Excel file: {e}", exc_info=True)
+            print(f"Warning: Failed to read Excel file, creating a new one: {e}")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_file = OUTPUT_EXCEL_FILE.replace(".xlsx", f"_corrupt_{timestamp}.xlsx")
+            try:
+                shutil.move(OUTPUT_EXCEL_FILE, backup_file)
+                logging.warning(f"Moved unreadable Excel file to: {backup_file}")
+                print(f"  Moved unreadable Excel file to: {backup_file}")
+            except Exception as move_error:
+                logging.error(
+                    f"Failed to move unreadable Excel file: {move_error}",
+                    exc_info=True,
+                )
+                print(f"  Warning: Failed to move unreadable Excel file: {move_error}")
+            return pd.DataFrame(columns=excel_columns)
+
+        for col in excel_columns:
+            if col not in existing_df.columns:
+                existing_df[col] = None
+        return existing_df
+    return pd.DataFrame(columns=excel_columns)
+
+
+def _get_latest_excel_output_file():
+    processed_dir = Path(PROCESSED_DATA_DIR)
+    if not processed_dir.exists():
+        return None
+
+    candidates = sorted(processed_dir.glob("permit_data_extracted*.xlsx"))
+    if not candidates:
+        candidates = sorted(processed_dir.glob("*.xlsx"))
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _normalize_facility_key(row):
+    parts = [
+        str(row.get("Facility Name", "")).strip().lower(),
+        str(row.get("Facility Address", "")).strip().lower(),
+        str(row.get("Facility City", "")).strip().lower(),
+        str(row.get("Facility State Abbreviation", "")).strip().lower(),
+        str(row.get("Facility Zip Code", "")).strip().lower(),
+    ]
+    if any(parts):
+        return "|".join(parts)
+    filename = str(row.get("Filename", "")).strip().lower()
+    return f"unknown::{filename}"
+
+
+def _cell_has_equipment_value(value):
+    if pd.isna(value):
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    if text.upper() in {"ERROR", "INVALID UNIT ENTRY"}:
+        return False
+    return True
+
+
+def clean_latest_excel_output():
+    latest_file = _get_latest_excel_output_file()
+    if not latest_file:
+        print("No Excel files found to clean.")
+        logging.info("No Excel files found for cleaning.")
+        return
+
+    try:
+        df = pd.read_excel(latest_file, engine="openpyxl")
+    except Exception as e:
+        logging.error(f"Failed to read Excel file for cleaning: {e}", exc_info=True)
+        print(f"ERROR: Failed to read Excel file for cleaning: {e}")
+        return
+
+    if df.empty:
+        print(f"Excel file '{latest_file.name}' is empty; skipping cleaning.")
+        logging.info("Excel file is empty; skipping cleaning.")
+        return
+
+    original_row_count = len(df)
+    removed_failures = 0
+    removed_duplicates = 0
+
+    if "Status" in df.columns:
+        status_series = df["Status"].fillna("").astype(str).str.lower()
+        success_mask = status_series.str.startswith("success")
+        removed_failures = int((~success_mask).sum())
+        df = df[success_mask].copy()
+
+    if df.empty:
+        print("All rows were filtered out as failures; nothing to deduplicate.")
+        logging.info("Cleaning removed all rows as failures.")
+        return
+
+    if "Processing Date" in df.columns:
+        processing_dates = pd.to_datetime(df["Processing Date"], errors="coerce")
+    else:
+        processing_dates = pd.Series([pd.NaT] * len(df), index=df.index)
+
+    if processing_dates.isna().all():
+        file_mtime = datetime.fromtimestamp(latest_file.stat().st_mtime)
+        processing_dates = pd.Series([file_mtime] * len(df), index=df.index)
+
+    df["Facility Key"] = df.apply(_normalize_facility_key, axis=1)
+
+    equipment_fields = [field for field in UNIT_DETAIL_FIELDS if field in df.columns]
+    if equipment_fields:
+        equipment_mask = df[equipment_fields].applymap(_cell_has_equipment_value).any(axis=1)
+    else:
+        equipment_mask = pd.Series([False] * len(df), index=df.index)
+
+    equipment_docs = df.loc[equipment_mask, ["Facility Key", "Filename"]]
+    equipment_doc_counts = (
+        equipment_docs.groupby("Facility Key")["Filename"].nunique()
+        if not equipment_docs.empty
+        else pd.Series(dtype=int)
+    )
+
+    df["Duplicate Equipment Documents"] = df["Facility Key"].map(equipment_doc_counts).fillna(0).astype(int)
+
+    df["__processing_date"] = processing_dates
+    latest_filename_by_facility = {}
+    for facility_key, facility_rows in df.groupby("Facility Key"):
+        max_date = facility_rows["__processing_date"].max()
+        latest_rows = facility_rows[facility_rows["__processing_date"] == max_date]
+        latest_filename = latest_rows["Filename"].dropna().astype(str).max()
+        latest_filename_by_facility[facility_key] = latest_filename
+
+    df["Latest Facility Filename"] = df["Facility Key"].map(latest_filename_by_facility)
+    keep_mask = df["Filename"].astype(str) == df["Latest Facility Filename"].astype(str)
+    removed_duplicates = int((~keep_mask).sum())
+    df = df[keep_mask].copy()
+
+    df.drop(columns=["Facility Key", "__processing_date"], inplace=True, errors="ignore")
+
+    backup_file = latest_file.with_name(latest_file.stem + "_pre_cleaning_backup.xlsx")
+    try:
+        shutil.copy2(latest_file, backup_file)
+        logging.info(f"Created pre-cleaning backup: {backup_file}")
+    except Exception as e:
+        logging.warning(f"Failed to create backup before cleaning: {e}")
+
+    try:
+        df.to_excel(latest_file, index=False, engine="openpyxl")
+        print(f"Cleaned Excel file saved: {latest_file}")
+        print(f"  - Removed failures: {removed_failures}")
+        print(f"  - Removed duplicate rows: {removed_duplicates}")
+        print(f"  - Rows before: {original_row_count}, after: {len(df)}")
+        logging.info(
+            "Cleaned Excel file saved: %s (removed failures=%s, removed duplicates=%s, before=%s, after=%s)",
+            latest_file,
+            removed_failures,
+            removed_duplicates,
+            original_row_count,
+            len(df),
+        )
+    except Exception as e:
+        logging.error(f"Failed to write cleaned Excel file: {e}", exc_info=True)
+        print(f"ERROR: Failed to write cleaned Excel file: {e}")
+
+
+def merge_rows(existing_df, new_rows, excel_columns):
+    """Merge new rows into existing dataframe, de-duplicating by Filename."""
+    if not new_rows:
+        return existing_df
+
+    # Add current date and model used to all new rows
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    for row in new_rows:
+        row["Processing Date"] = current_date
+        if "Model Used" not in row:
+            row["Model Used"] = LLM_MODEL
+
+    # Ensure all columns exist in new rows
+    for row in new_rows:
+        for col in excel_columns:
+            if col not in row:
+                row[col] = None
+
+    new_df = pd.DataFrame(new_rows)
+    new_df = new_df[excel_columns]
+
+    if existing_df is None or existing_df.empty:
+        return new_df
+
+    filenames_to_update = set(new_df['Filename'].unique())
+    existing_df = existing_df[~existing_df['Filename'].isin(filenames_to_update)]
+    return pd.concat([existing_df, new_df], ignore_index=True)
 
 
 def configure_llm():
@@ -797,25 +998,38 @@ def read_text_from_file(file_path):
         return None
 
 
-def extract_info_with_llm(client, text_content, filename):
+def _is_token_limit_error(error):
+    """Heuristics for identifying token/context limit errors."""
+    message = str(error).lower()
+    return (
+        "maximum context length" in message
+        or "context length" in message
+        or "context window" in message
+        or "token limit" in message
+        or "too many tokens" in message
+        or ("context" in message and "token" in message)
+    )
+
+
+def extract_info_with_llm(client, text_content, filename, *, allow_large_model_retry=False):
     """Sends text to the LLM and attempts to parse the JSON response."""
     if not client or not text_content:
         logging.warning(f"  Skipping LLM call for {filename} due to missing client or text.")
-        return None
+        return None, None
 
     try:
         prompt = PROMPT_TEMPLATE.format(permit_text=text_content)
     except Exception as format_e:
         logging.error(f"  Internal Error: An unexpected error occurred during prompt formatting: {format_e}", exc_info=True)
-        return None
+        return None, None
 
     logging.info(f"  Sending text from {filename} to LLM (approx {len(text_content)} chars)...")
-    try:
+    def _invoke_llm(model_name):
         time.sleep(1.0)  # API call delay
-        
-        logging.info(f"  Making API call for {filename}...")
+
+        logging.info(f"  Making API call for {filename} using model {model_name}...")
         response = client.chat.completions.create(
-            model=LLM_MODEL,
+            model=model_name,
             messages=[
                 {"role": "system", "content": "You are an expert at extracting structured information from industrial air permit documents. Always respond with valid JSON."},
                 {"role": "user", "content": prompt}
@@ -825,36 +1039,36 @@ def extract_info_with_llm(client, text_content, filename):
             timeout=60,  # 60 second timeout
             response_format={"type": "json_object"}  # Ensures JSON response
         )
-        
-        logging.info(f"  API call completed for {filename}")
+
+        logging.info(f"  API call completed for {filename} using model {model_name}")
         extracted_data = None
         json_text_response = None  # For logging in case of error
 
         if response and response.choices and len(response.choices) > 0:
             try:
                 json_text_response = response.choices[0].message.content.strip()
-                
+
                 # Since we're using response_format={"type": "json_object"}, the response should already be valid JSON
                 # But we'll still clean up just in case
                 if '```json' in json_text_response:
                     json_text_response = json_text_response.split('```json')[1].split('```')[0].strip()
                 elif '```' in json_text_response:
                     json_text_response = json_text_response.split('```')[1].split('```')[0].strip()
-                
+
                 try:
                     extracted_data = json.loads(json_text_response)
                 except json.JSONDecodeError as json_e:
                     logging.error(f"  Failed to decode JSON for {filename}. Error: {json_e}")
                     logging.error(f"  Raw response text:\n{json_text_response[:1000]}...")
                     return None
-                
+
                 logging.info(f"  Successfully extracted and parsed JSON from {filename}.")
-                
+
                 if "Emission Units" not in extracted_data or not isinstance(extracted_data.get("Emission Units"), list):
                     logging.warning(f"  LLM response for {filename} parsed, but 'Emission Units' key is missing or not a list. Treating as no units found.")
                     extracted_data["Emission Units"] = []
                 return extracted_data
-                
+
             except Exception as e:
                 logging.error(f"  Error processing response for {filename}: {e}", exc_info=True)
                 return None
@@ -864,11 +1078,120 @@ def extract_info_with_llm(client, text_content, filename):
                 logging.error(f"  Response object type: {type(response)}")
                 logging.error(f"  Response choices: {response.choices if hasattr(response, 'choices') else 'No choices'}")
             return None
+
+    try:
+        extracted_data = _invoke_llm(LLM_MODEL)
+        return extracted_data, LLM_MODEL
     except Exception as e:
+        if allow_large_model_retry and _is_token_limit_error(e) and LLM_LARGE_MODEL != LLM_MODEL:
+            logging.warning(
+                f"  Token limit exceeded for {filename} using {LLM_MODEL}. Retrying with {LLM_LARGE_MODEL}."
+            )
+            try:
+                extracted_data = _invoke_llm(LLM_LARGE_MODEL)
+                return extracted_data, LLM_LARGE_MODEL
+            except Exception as retry_e:
+                logging.error(f"  Error during LLM API call for {filename}: {retry_e}", exc_info=True)
+                if "API key not valid" in str(retry_e):
+                    logging.error("  Hint: Double-check your OPENAI_API_KEY setting.")
+                return None, LLM_LARGE_MODEL
+
         logging.error(f"  Error during LLM API call for {filename}: {e}", exc_info=True)
         if "API key not valid" in str(e):
             logging.error("  Hint: Double-check your OPENAI_API_KEY setting.")
-        return None
+        return None, LLM_MODEL
+
+
+def process_text_file(idx, total, txt_file_path, llm_client, allow_large_model_retry=False):
+    """Process a single text file: read, extract, and move."""
+    original_filename = txt_file_path.stem
+    file_rows = []
+    model_used = None
+    try:
+        print(f"\nProcessing text file {idx}/{total}: {txt_file_path.name}")
+        logging.info(f"\nProcessing text file {idx}/{total}: {txt_file_path.name}")
+
+        permit_text_content = read_text_from_file(txt_file_path)
+        if not permit_text_content:
+            logging.warning(f"  Skipping file {original_filename} due to text reading error or empty content.")
+            file_rows.append({
+                "Filename": original_filename,
+                "Status": "Text Reading Failed",
+                "Model Used": None,
+                **{field: "ERROR" for field in ALL_OUTPUT_FIELDS}
+            })
+            move_processed_file(txt_file_path, success=False)
+            return file_rows
+
+        MAX_CHARS = 1500000  # Example
+        if len(permit_text_content) > MAX_CHARS:
+            logging.warning(f"  Text from {original_filename} is very long ({len(permit_text_content)} chars). Processing may be slow/costly.")
+
+        extracted_info, model_used = extract_info_with_llm(
+            llm_client,
+            permit_text_content,
+            original_filename,
+            allow_large_model_retry=allow_large_model_retry
+        )
+
+        if extracted_info and isinstance(extracted_info, dict):
+            general_info = {field: extracted_info.get(field) for field in GENERAL_TARGET_FIELDS}
+            emission_units = extracted_info.get("Emission Units", [])
+
+            if not isinstance(emission_units, list):
+                logging.warning(f"  'Emission Units' field in response for {original_filename} was not a list. Treating as no units found. Value: {emission_units}")
+                emission_units = []
+
+            if emission_units:
+                logging.info(f"  Extracted {len(emission_units)} emission units from {original_filename}.")
+                for unit in emission_units:
+                    if isinstance(unit, dict):
+                        row_data = {"Filename": original_filename, "Status": "Success", "Model Used": model_used}
+                        row_data.update(general_info)
+                        for field in UNIT_DETAIL_FIELDS:
+                            row_data[field] = unit.get(field)
+                        file_rows.append(row_data)
+                    else:
+                        logging.warning(f"  Skipping invalid unit entry (not a dict) in {original_filename}: {unit}")
+                        row_data = {"Filename": original_filename, "Status": "Malformed Unit Data", "Model Used": model_used}
+                        row_data.update(general_info)
+                        for field in UNIT_DETAIL_FIELDS:
+                            row_data[field] = "INVALID UNIT ENTRY"
+                        file_rows.append(row_data)
+
+                move_processed_file(txt_file_path, success=True)
+            else:
+                logging.info(f"  No valid emission units extracted or found for {original_filename}.")
+                row_data = {"Filename": original_filename, "Status": "Success (No Units Found)", "Model Used": model_used}
+                row_data.update(general_info)
+                for field in UNIT_DETAIL_FIELDS:
+                    row_data[field] = None
+                file_rows.append(row_data)
+                move_processed_file(txt_file_path, success=True)
+        else:
+            logging.error(f"  Failed to extract information from {original_filename} (LLM call returned None or invalid data).")
+            file_rows.append({
+                "Filename": original_filename,
+                "Status": "LLM Extraction Failed",
+                "Model Used": model_used,
+                **{field: "ERROR" for field in ALL_OUTPUT_FIELDS}
+            })
+            move_processed_file(txt_file_path, success=False)
+
+        return file_rows
+    except Exception as e:
+        logging.error(f"  Unexpected error processing {original_filename}: {e}", exc_info=True)
+        file_rows.append({
+            "Filename": original_filename,
+            "Status": "Processing Error",
+            "Model Used": model_used,
+            **{field: "ERROR" for field in ALL_OUTPUT_FIELDS}
+        })
+        try:
+            move_processed_file(txt_file_path, success=False)
+        except Exception:
+            pass
+        return file_rows
 
 
 @app.command()
@@ -952,93 +1275,58 @@ def main(
     print(f"Processing {len(text_files)} .txt files...")
     logging.info(f"Found {len(text_files)} .txt files to process.")
     processed_data_rows = []
+    excel_columns = ["Filename", "Status", "Processing Date", "Model Used"] + ALL_OUTPUT_FIELDS + ["Spec Sheet Link"]
+    output_df = load_existing_excel(excel_columns)
+    files_since_save = 0
 
     # Limit to first 3 files for testing
     # test_files = text_files[:3]
     logging.info(f"Processing first {len(text_files)} files for testing...")
 
-    for i, txt_file_path in enumerate(text_files, 1):
-        print(f"\nProcessing text file {i}/{len(text_files)}: {txt_file_path.name}")
-        logging.info(f"\nProcessing text file {i}/{len(text_files)}: {txt_file_path.name}")
-        original_filename = txt_file_path.stem # Assumes .txt was added to original PDF stem
-        
-        # Collect rows for this file
-        file_rows = []
+    with ThreadPoolExecutor(max_workers=LLM_MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(
+                process_text_file,
+                i,
+                len(text_files),
+                txt_file_path,
+                llm_client,
+                retry_failed
+            )
+            for i, txt_file_path in enumerate(text_files, 1)
+        ]
 
-        permit_text_content = read_text_from_file(txt_file_path)
-        if not permit_text_content:
-            logging.warning(f"  Skipping file {original_filename} due to text reading error or empty content.")
-            file_rows.append({"Filename": original_filename, "Status": "Text Reading Failed", **{field: "ERROR" for field in ALL_OUTPUT_FIELDS}})
-            # Move file to failed folder - failed to read
-            move_processed_file(txt_file_path, success=False)
-            # Save immediately
-            append_rows_to_excel(file_rows)
-            processed_data_rows.extend(file_rows)
-            continue
+        for future in tqdm(as_completed(futures), total=len(futures), desc="LLM extraction"):
+            try:
+                file_rows = future.result()
+            except Exception as e:
+                logging.error(f"Unexpected worker failure: {e}", exc_info=True)
+                file_rows = []
 
-        # MAX_CHARS check can still be useful here if there's a concern about LLM input limits
-        MAX_CHARS = 1500000 # Example
-        if len(permit_text_content) > MAX_CHARS:
-            logging.warning(f"  Text from {original_filename} is very long ({len(permit_text_content)} chars). Processing may be slow/costly.")
-            # permit_text_content = permit_text_content[:MAX_CHARS] # Optional truncation
+            if file_rows:
+                output_df = merge_rows(output_df, file_rows, excel_columns)
+                processed_data_rows.extend(file_rows)
+                print(f"  ✓ Saved {len(file_rows)} row(s) to Excel")
+                files_since_save += 1
 
-        extracted_info = extract_info_with_llm(llm_client, permit_text_content, original_filename)
-
-        # Process results (same logic as before)
-        if extracted_info and isinstance(extracted_info, dict):
-            general_info = {field: extracted_info.get(field) for field in GENERAL_TARGET_FIELDS}
-            emission_units = extracted_info.get("Emission Units", [])
-
-            if not isinstance(emission_units, list):
-                logging.warning(f"  'Emission Units' field in response for {original_filename} was not a list. Treating as no units found. Value: {emission_units}")
-                emission_units = []
-
-            if emission_units:
-                logging.info(f"  Extracted {len(emission_units)} emission units from {original_filename}.")
-                for unit in emission_units:
-                    if isinstance(unit, dict):
-                        row_data = {"Filename": original_filename, "Status": "Success"}
-                        row_data.update(general_info)
-                        for field in UNIT_DETAIL_FIELDS:
-                            row_data[field] = unit.get(field)
-                        file_rows.append(row_data)
-                    else:
-                        logging.warning(f"  Skipping invalid unit entry (not a dict) in {original_filename}: {unit}")
-                        # ... (malformed unit data logging as before)
-                        row_data = {"Filename": original_filename, "Status": "Malformed Unit Data"}
-                        row_data.update(general_info)
-                        for field in UNIT_DETAIL_FIELDS: row_data[field] = "INVALID UNIT ENTRY"
-                        file_rows.append(row_data)
-                
-                # Move file to completed folder - successful extraction with units
-                move_processed_file(txt_file_path, success=True)
-
-            else:
-                logging.info(f"  No valid emission units extracted or found for {original_filename}.")
-                # ... (no units found logging as before)
-                row_data = {"Filename": original_filename, "Status": "Success (No Units Found)"}
-                row_data.update(general_info)
-                for field in UNIT_DETAIL_FIELDS: row_data[field] = None
-                file_rows.append(row_data)
-                
-                # Move file to completed folder - successful extraction but no units
-                move_processed_file(txt_file_path, success=True)
-        else:
-            logging.error(f"  Failed to extract information from {original_filename} (LLM call returned None or invalid data).")
-            # ... (LLM extraction failed logging as before)
-            file_rows.append({"Filename": original_filename, "Status": "LLM Extraction Failed", **{field: "ERROR" for field in ALL_OUTPUT_FIELDS}})
-            
-            # Move file to failed folder - failed extraction
-            move_processed_file(txt_file_path, success=False)
-        
-        # Save rows for this file immediately to prevent data loss
-        if file_rows:
-            append_rows_to_excel(file_rows)
-            processed_data_rows.extend(file_rows)
-            print(f"  ✓ Saved {len(file_rows)} row(s) to Excel")
+                if files_since_save >= SAVE_EVERY_N_FILES:
+                    try:
+                        output_df.to_excel(OUTPUT_EXCEL_FILE, index=False, engine='openpyxl')
+                        logging.info(f"  Wrote batch to Excel after {files_since_save} files")
+                        files_since_save = 0
+                    except Exception as e:
+                        logging.error(f"Error writing batch to Excel: {e}", exc_info=True)
 
 
     # Add spec sheet links if enabled (rows are already saved incrementally)
+    if processed_data_rows:
+        try:
+            output_df.to_excel(OUTPUT_EXCEL_FILE, index=False, engine='openpyxl')
+            logging.info(f"Final Excel write complete: {OUTPUT_EXCEL_FILE}")
+        except Exception as e:
+            logging.error(f"Error writing final Excel file: {e}", exc_info=True)
+            print(f"  Warning: Failed to save final Excel: {e}")
+
     if processed_data_rows and ENABLE_SPEC_SHEET_LOOKUP:
         logging.info(f"\nAdding spec sheet links to existing Excel file...")
         try:
@@ -1070,6 +1358,10 @@ def main(
     else:
         print("No data was processed to save.")
         logging.warning("No data was processed to save.")
+
+    print("\nStep 4: Cleaning latest Excel output...")
+    logging.info("Starting cleaning step for latest Excel output.")
+    clean_latest_excel_output()
 
     print(f"\nLLM Extraction process finished!")
     print(f"Processed {len(text_files)} files")

@@ -48,6 +48,22 @@ OCR_DPI = 200       # DPI for converting PDF pages to images for OCR
 # --- Function Definitions ---
 
 
+def load_completed_text_files(text_output_dir: Path):
+    """Collect filenames already completed by LLM extraction."""
+    completed_dir = text_output_dir / "completed"
+    completed_files = set()
+
+    if completed_dir.exists():
+        for txt_file in completed_dir.rglob("*.txt"):
+            completed_files.add(txt_file.name)
+            name_parts = txt_file.stem.split('_')
+            if len(name_parts) > 1 and name_parts[-1].isdigit():
+                original_name = '_'.join(name_parts[:-1]) + txt_file.suffix
+                completed_files.add(original_name)
+
+    return completed_files
+
+
 def get_pdf_page_count_pdf2image(pdf_path, poppler_path_to_use=None):
     """Gets PDF page count using pdfinfo_from_path to avoid PyPDF2 issues with some PDFs."""
     if not pdfinfo_from_path:
@@ -295,14 +311,38 @@ def main():
     logging.info(f"Found {len(pdf_files)} PDF files to process.")
     summary = []
 
+    completed_files = load_completed_text_files(TEXT_OUTPUT_DIR)
+
     for pdf_path in pdf_files:
         logging.info(f"\nProcessing file: {pdf_path.name}")
+        output_filename = pdf_path.stem + ".txt"
+        output_file_path = TEXT_OUTPUT_DIR / output_filename
+
+        if output_file_path.exists():
+            logging.info(f"  Skipping {pdf_path.name}: text already extracted.")
+            summary.append({
+                "filename": pdf_path.name,
+                "status": "Skipped",
+                "method": "Already Extracted",
+                "output_file": str(output_file_path),
+                "processed_pdf": None
+            })
+            continue
+        if output_filename in completed_files:
+            logging.info(f"  Skipping {pdf_path.name}: already completed in LLM extraction.")
+            summary.append({
+                "filename": pdf_path.name,
+                "status": "Skipped",
+                "method": "Already Completed",
+                "output_file": str(output_file_path),
+                "processed_pdf": None
+            })
+            continue
+
         # Ensure text_content is not None before trying to use it
         text_content, method = extract_text_from_single_pdf(pdf_path)
 
         if text_content is not None: # Check if text_content is not None
-            output_filename = pdf_path.stem + ".txt"
-            output_file_path = TEXT_OUTPUT_DIR / output_filename
             save_text_to_file(text_content, output_file_path)
             moved_path = move_processed_pdf(pdf_path, PROCESSED_PDF_DIR)
             summary.append({

@@ -7,9 +7,11 @@ from pathlib import Path
 from typing import List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
+import openai
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+from dotenv import dotenv_values
 from loguru import logger
 from requests.adapters import HTTPAdapter
 from selenium import webdriver
@@ -22,10 +24,10 @@ from urllib3.util.retry import Retry
 
 from permit_data_extraction.config import RAW_DATA_DIR
 
-# LLM Configuration
-LLM_API_KEY = os.getenv("API_KEY")  # Set your Google API key as environment variable
-LLM_MODEL = "gemini-2.5-flash"  # You can change this to gemini-1.5-pro for better accuracy
-LLM_ENABLED = LLM_API_KEY is not None
+# LLM Configuration (OpenAI-compatible API at cborg)
+OPENAI_API_KEY = dotenv_values().get("CBORG_API_KEY") or os.getenv("CBORG_API_KEY")
+LLM_MODEL = "lbl/cborg-deepthought"
+LLM_ENABLED = OPENAI_API_KEY is not None
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -135,30 +137,42 @@ Respond with a JSON array where each object has:
 Only return the JSON array, no other text.
 """
 
-        data = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.3,
-                "maxOutputTokens": 1000,
-                "candidateCount": 1,
-            },
-        }
-
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models"
-            f"/{LLM_MODEL}:generateContent?key={LLM_API_KEY}"
+        client = openai.OpenAI(
+            api_key=OPENAI_API_KEY,
+            base_url="https://api.cborg.lbl.gov",
         )
-        response = requests.post(url, json=data, timeout=45)
-        response.raise_for_status()
-
-        result = response.json()
-        content = (
-            result["candidates"][0]["content"]["parts"][0]["text"].strip()
-            if result.get("candidates")
-            else ""
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You analyze links from government or municipal websites. Always respond with a valid JSON array only, no other text.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=1000,
+            timeout=45,
         )
 
-        evaluations = json.loads(content)
+        if not response.choices:
+            logger.warning("LLM returned no choices.")
+            return []
+
+        content = response.choices[0].message.content.strip()
+        if not content:
+            logger.warning("LLM returned empty content.")
+            return []
+
+        json_start = content.find("[")
+        json_end = content.rfind("]")
+        json_payload = (
+            content[json_start : json_end + 1]
+            if json_start != -1 and json_end != -1 and json_end > json_start
+            else content
+        )
+
+        evaluations = json.loads(json_payload)
         permit_links: List[Tuple[str, str, float, str, bool]] = []
         for evaluation in evaluations:
             if evaluation.get("likely_facility_specific"):
@@ -175,7 +189,7 @@ Only return the JSON array, no other text.
                     )
         return permit_links
     except Exception as exc:
-        logger.warning(f"Gemini evaluation failed: {exc}")
+        logger.warning(f"LLM evaluation failed: {exc}")
         return []
 
 
@@ -219,6 +233,7 @@ class SeleniumPDFDownloader:
         wait_seconds: int = 4,
         max_depth: int = 2,
         use_llm: bool = True,
+        user_agent: Optional[str] = None,
     ) -> None:
         self.output_dir = Path(output_dir).expanduser()
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -230,6 +245,7 @@ class SeleniumPDFDownloader:
         self.wait_seconds = wait_seconds
         self.max_depth = max_depth
         self.use_llm = use_llm and LLM_ENABLED
+        self.user_agent = user_agent
 
         self.visited_urls: Set[str] = set()
         self.session = _create_requests_session()
@@ -243,6 +259,8 @@ class SeleniumPDFDownloader:
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--window-size=1920,1080")
+        if self.user_agent:
+            chrome_options.add_argument(f"--user-agent={self.user_agent}")
 
         prefs = {
             "download.default_directory": str(self.temp_dir.resolve()),
@@ -649,14 +667,14 @@ class SeleniumPDFDownloader:
                     )
 
         if self.use_llm and llm_candidates and depth < self.max_depth:
-            logger.info(f"{'  ' * depth}Sending {len(llm_candidates)} links to Gemini for scoring…")
+            logger.info(f"{'  ' * depth}Sending {len(llm_candidates)} links to LLM for scoring…")
             page_title = soup.title.string if soup.title else ""
             llm_results = evaluate_links_with_llm(llm_candidates, f"Page title: {page_title}")
             for url_link, link_text, confidence, facility_name, in_table in llm_results:
                 if confidence >= 0.6:
                     permit_links.append((url_link, link_text, in_table))
                     logger.info(
-                        f"{'  ' * depth}Gemini identified {facility_name} via '{link_text[:60]}' "
+                        f"{'  ' * depth}LLM identified {facility_name} via '{link_text[:60]}' "
                         f"(confidence {confidence:.2f})"
                     )
 
@@ -699,11 +717,11 @@ def download_pdf(
     logger.info(f"Maximum link depth: {max_depth}")
     logger.info("Target: Facility-specific permit documents only")
     if downloader.use_llm:
-        logger.info(f"Gemini-enhanced facility detection ENABLED ({LLM_MODEL})")
+        logger.info(f"LLM-enhanced facility detection ENABLED ({LLM_MODEL})")
     elif use_llm and not LLM_ENABLED:
-        logger.info("Gemini-enhanced facility detection DISABLED (API key missing)")
+        logger.info("LLM-enhanced facility detection DISABLED (CBORG_API_KEY missing)")
     else:
-        logger.info("Gemini-enhanced facility detection DISABLED")
+        logger.info("LLM-enhanced facility detection DISABLED")
     logger.info("-" * 60)
 
     try:
@@ -807,10 +825,10 @@ if __name__ == "__main__":
 
     use_llm = False
     if LLM_ENABLED:
-        use_llm_input = input("Use Gemini to identify facility-specific permits? (y/n, default=y): ").lower()
+        use_llm_input = input("Use LLM to identify facility-specific permits? (y/n, default=y): ").lower()
         use_llm = use_llm_input != "n"
     else:
-        print("Gemini not available (set API_KEY environment variable to enable)")
+        print("LLM not available (set CBORG_API_KEY environment variable or .env to enable)")
 
     try:
         max_depth = int(

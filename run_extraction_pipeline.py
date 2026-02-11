@@ -13,6 +13,9 @@ Usage:
 
 from pathlib import Path
 import sys
+import json
+import traceback
+from datetime import datetime
 
 # Add project to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -21,9 +24,26 @@ from permit_data_extraction.ocr import extract_text_from_single_pdf
 from permit_data_extraction.config import RAW_DATA_DIR, INTERIM_DATA_DIR
 
 
+def _load_completed_text_files(text_output_dir: Path):
+    """Collect filenames already completed by LLM extraction."""
+    completed_dir = text_output_dir / "completed"
+    completed_files = set()
+
+    if completed_dir.exists():
+        for txt_file in completed_dir.rglob("*.txt"):
+            completed_files.add(txt_file.name)
+            name_parts = txt_file.stem.split('_')
+            if len(name_parts) > 1 and name_parts[-1].isdigit():
+                original_name = '_'.join(name_parts[:-1]) + txt_file.suffix
+                completed_files.add(original_name)
+
+    return completed_files
+
+
 def find_all_pdfs(raw_dir):
     """Find all PDF files in the raw data directory."""
     raw_path = Path(raw_dir)
+    processed_dir = raw_path / "processed"
     
     # Find PDFs in multiple locations
     pdf_files = []
@@ -43,6 +63,13 @@ def find_all_pdfs(raw_dir):
     
     # Remove duplicates and sort
     pdf_files = sorted(set(pdf_files))
+
+    # Exclude any PDFs already moved to raw/processed
+    if processed_dir.exists():
+        pdf_files = [
+            pdf_path for pdf_path in pdf_files
+            if processed_dir not in pdf_path.parents
+        ]
     
     return pdf_files
 
@@ -52,6 +79,7 @@ def extract_text_from_all_pdfs(pdf_files, output_dir):
     
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    completed_files = _load_completed_text_files(output_path)
     
     print(f"\n{'='*80}")
     print(f"PDF TEXT EXTRACTION")
@@ -73,9 +101,13 @@ def extract_text_from_all_pdfs(pdf_files, output_dir):
         output_filename = pdf_path.stem + '.txt'
         output_file = output_path / output_filename
         
-        # Skip if already extracted
+        # Skip if already extracted or already completed by LLM extraction
         if output_file.exists():
             print(f"[{i}/{len(pdf_files)}] ⊙ SKIP: {pdf_path.name} (already extracted)")
+            results['skipped'] += 1
+            continue
+        if output_filename in completed_files:
+            print(f"[{i}/{len(pdf_files)}] ⊙ SKIP: {pdf_path.name} (already completed)")
             results['skipped'] += 1
             continue
         
@@ -97,7 +129,8 @@ def extract_text_from_all_pdfs(pdf_files, output_dir):
                 results['failed'] += 1
                 results['errors'].append({
                     'file': str(pdf_path),
-                    'error': f'No text extracted ({method})'
+                    'error': f'No text extracted ({method})',
+                    'method': method
                 })
         
         except Exception as e:
@@ -105,7 +138,9 @@ def extract_text_from_all_pdfs(pdf_files, output_dir):
             results['failed'] += 1
             results['errors'].append({
                 'file': str(pdf_path),
-                'error': str(e)
+                'error': str(e),
+                'exception_type': type(e).__name__,
+                'traceback': traceback.format_exc()
             })
     
     # Print summary
@@ -125,6 +160,14 @@ def extract_text_from_all_pdfs(pdf_files, output_dir):
             print(f"  - {Path(error['file']).name}: {error['error']}")
         if len(results['errors']) > 10:
             print(f"  ... and {len(results['errors']) - 10} more")
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        error_report_path = output_path / f"extraction_errors_{timestamp}.json"
+        error_report_path.write_text(
+            json.dumps(results['errors'], indent=2),
+            encoding="utf-8"
+        )
+        print(f"\nFull error report saved to: {error_report_path}")
     
     return results
 
