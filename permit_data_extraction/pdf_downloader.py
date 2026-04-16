@@ -345,6 +345,7 @@ class SeleniumPDFDownloader:
         link_text: str,
         is_table_link: bool,
         attempt: int = 0,
+        save_as: Optional[str] = None,
     ) -> bool:
         if attempt > 3:
             logger.warning(f"Exceeded retry attempts while resolving {pdf_url}")
@@ -407,7 +408,9 @@ class SeleniumPDFDownloader:
                 if not downloaded_path or not downloaded_path.exists():
                     resolved = self._resolve_pdf_via_browser(pdf_url)
                     if resolved and resolved != pdf_url:
-                        return self._download_pdf(resolved, referer, link_text, is_table_link, attempt + 1)
+                        return self._download_pdf(
+                            resolved, referer, link_text, is_table_link, attempt + 1, save_as
+                        )
                     return False
             else:
                 content_type = response.headers.get("content-type", "").lower()
@@ -416,11 +419,15 @@ class SeleniumPDFDownloader:
                     pdf_candidate = self._find_pdf_link_in_html(html_bytes, pdf_url)
                     if pdf_candidate and pdf_candidate != pdf_url:
                         logger.debug(f"Resolved HTML intermediate to PDF: {pdf_candidate}")
-                        return self._download_pdf(pdf_candidate, referer, link_text, is_table_link, attempt + 1)
+                        return self._download_pdf(
+                            pdf_candidate, referer, link_text, is_table_link, attempt + 1, save_as
+                        )
                     resolved = self._resolve_pdf_via_browser(pdf_url)
                     if resolved and resolved != pdf_url:
                         logger.debug(f"Browser resolved PDF URL: {resolved}")
-                        return self._download_pdf(resolved, referer, link_text, is_table_link, attempt + 1)
+                        return self._download_pdf(
+                            resolved, referer, link_text, is_table_link, attempt + 1, save_as
+                        )
                     logger.debug(f"Non-PDF content returned from {pdf_url}; skipping.")
                     return False
 
@@ -440,6 +447,11 @@ class SeleniumPDFDownloader:
             return False
 
         final_name = downloaded_path.name
+        if save_as:
+            fn = clean_filename(save_as.strip())
+            if not fn.lower().endswith(".pdf"):
+                fn = f"{fn}.pdf"
+            final_name = fn
         final_path = self._prepare_final_path(final_name)
         downloaded_path.replace(final_path)
 
@@ -553,12 +565,20 @@ class SeleniumPDFDownloader:
         return self.output_dir / filename
 
     def download_document(
-        self, doc_url: str, referer: str, link_text: str = "", is_table_link: bool = False
+        self,
+        doc_url: str,
+        referer: str,
+        link_text: str = "",
+        is_table_link: bool = False,
+        save_as: Optional[str] = None,
     ) -> bool:
         """
         Public wrapper for downloading a specific document URL using the current browser session.
+
+        If ``save_as`` is set, the file is stored under that name (after cleaning), overriding
+        identical Content-Disposition names from the server.
         """
-        return self._download_pdf(doc_url, referer, link_text, is_table_link)
+        return self._download_pdf(doc_url, referer, link_text, is_table_link, 0, save_as)
 
     def _extract_links(self, soup: BeautifulSoup) -> Tuple[List[LinkCandidate], List[LinkCandidate]]:
         navigation_selectors = [

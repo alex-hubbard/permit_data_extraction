@@ -249,7 +249,7 @@ class TestGPT4Extraction:
     
     def test_prompt_template_formatting(self, sample_permit_text):
         """Test that the prompt template formats correctly."""
-        formatted_prompt = PROMPT_TEMPLATE.format(permit_text=sample_permit_text)
+        formatted_prompt = PROMPT_TEMPLATE.replace("{permit_text}", sample_permit_text)
         
         assert "permit_text" not in formatted_prompt  # Should be replaced
         assert sample_permit_text in formatted_prompt

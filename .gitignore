@@ -1,6 +1,8 @@
 # Data
 /data/
 /reports
+/presentation
+/docs
 
 # Test results
 /test_results/

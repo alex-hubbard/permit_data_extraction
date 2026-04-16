@@ -25,12 +25,14 @@ class PermitDataGenerator:
         """Generate synthetic facility information."""
         return {
             "Facility Name": f"{self.fake.company()} {random.choice(['Plant', 'Facility', 'Manufacturing', 'Industrial Center'])}",
+            "Owner/Operator Name": f"{self.fake.company()} LLC",
             "Facility Address": self.fake.street_address(),
             "Facility City": self.fake.city(),
             "Facility State Abbreviation": self.fake.state_abbr(),
             "Facility Zip Code": self.fake.zipcode(),
             "Facility County": f"{self.fake.last_name()} County",
             "NAICS Code": f"{random.randint(100000, 999999)}",
+            "SIC Code": f"{random.randint(2000, 3999)}",
             "Operating Hours": random.choice(["24/7", "8:00 AM - 5:00 PM", "6:00 AM - 10:00 PM", "Monday-Friday 8:00 AM - 5:00 PM"]),
             "Industry Description": random.choice([
                 "Food Manufacturing", "Chemical Manufacturing", "Metal Fabrication",
@@ -48,6 +50,7 @@ class PermitDataGenerator:
         
         return {
             "Permit Number": permit_num,
+            "Permit Type": random.choice(["Title V", "State Only Operating Permit", "Synthetic Minor", "PSD"]),
             "Issuance Date": self.fake.date_between(start_date=date(year, 1, 1), end_date=date(year, 12, 31)).strftime("%Y-%m-%d"),
             "Expiration Date": self.fake.date_between(start_date=date(year+5, 1, 1), end_date=date(year+5, 12, 31)).strftime("%Y-%m-%d"),
             "Regulatory Authority": f"{state} EPA",
@@ -86,6 +89,18 @@ class PermitDataGenerator:
             "Emergency Generator": "NOx, CO, PM"
         }
         
+        neshap_subparts = {
+            "Natural Gas Boiler": "40 CFR 63 Subpart DDDDD",
+            "Coal Boiler": "40 CFR 63 Subpart DDDDD",
+            "Emergency Generator": "40 CFR 63 Subpart ZZZZ",
+            "Process Heater": "40 CFR 63 Subpart DDDDD",
+        }
+        throughput_limits = {
+            "Paint Booth": "500 gallons/day",
+            "Coating Line": "1000 gallons/day",
+            "Crusher": "200 tons/hr",
+            "Grinder": "50 tons/hr",
+        }
         return {
             "Unit ID": unit_id,
             "Unit Description": f"{unit_type} #{random.randint(1, 10)}",
@@ -95,11 +110,14 @@ class PermitDataGenerator:
             "Unit Type": unit_type,
             "Pollutants": pollutants.get(unit_type, "Various"),
             "Emission Limits": self._generate_emission_limits(unit_type),
+            "Opacity Limit": random.choice(["20%", "10% (3 min/hr); 30% (any time)", None]),
+            "Throughput/Production Limit": throughput_limits.get(unit_type, None),
             "Control Device(s)": self._generate_control_device(unit_type),
             "Capacity Value": str(random.randint(10, 1000)),
             "Capacity Unit": self._get_capacity_unit(unit_type),
             "Fuel Type": self._get_fuel_type(unit_type),
-            "Rated Efficiency": f"{random.randint(70, 95)}%"
+            "Rated Efficiency": f"{random.randint(70, 95)}%",
+            "Applicable NESHAP/NSPS Subpart": neshap_subparts.get(unit_type, None),
         }
     
     def _generate_emission_limits(self, unit_type: str) -> str:

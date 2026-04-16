@@ -15,12 +15,17 @@ from pathlib import Path
 import sys
 import json
 import traceback
+from collections import Counter
 from datetime import datetime
 
 # Add project to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from permit_data_extraction.ocr import extract_text_from_single_pdf
+from permit_data_extraction.ocr import (
+    atomic_write_text,
+    extract_text_from_single_pdf,
+    state_code_for_raw_pdf_path,
+)
 from permit_data_extraction.config import RAW_DATA_DIR, INTERIM_DATA_DIR
 
 
@@ -93,22 +98,31 @@ def extract_text_from_all_pdfs(pdf_files, output_dir):
         'successful': 0,
         'failed': 0,
         'skipped': 0,
-        'errors': []
+        'errors': [],
+        'processed_by_state': Counter(),
+        'skipped_by_state': Counter(),
+        'failed_by_state': Counter(),
+        'ocr_fallback_by_state': Counter(),
     }
-    
+    raw_path = Path(RAW_DATA_DIR)
+
     for i, pdf_path in enumerate(pdf_files, 1):
         # Create output filename
         output_filename = pdf_path.stem + '.txt'
         output_file = output_path / output_filename
         
+        state = state_code_for_raw_pdf_path(pdf_path, raw_path)
+
         # Skip if already extracted or already completed by LLM extraction
         if output_file.exists():
             print(f"[{i}/{len(pdf_files)}] ⊙ SKIP: {pdf_path.name} (already extracted)")
             results['skipped'] += 1
+            results['skipped_by_state'][state] += 1
             continue
         if output_filename in completed_files:
             print(f"[{i}/{len(pdf_files)}] ⊙ SKIP: {pdf_path.name} (already completed)")
             results['skipped'] += 1
+            results['skipped_by_state'][state] += 1
             continue
         
         print(f"[{i}/{len(pdf_files)}] Processing: {pdf_path.name}")
@@ -118,15 +132,19 @@ def extract_text_from_all_pdfs(pdf_files, output_dir):
             text, method = extract_text_from_single_pdf(pdf_path)
             
             if text:
-                # Save to file
-                output_file.write_text(text, encoding='utf-8')
+                # Save to file (atomic write avoids truncated .txt on interrupt)
+                atomic_write_text(output_file, text)
                 char_count = len(text)
                 print(f"  ✓ SUCCESS: {char_count:,} characters ({method})")
                 print(f"  Saved to: {output_filename}")
                 results['successful'] += 1
+                results['processed_by_state'][state] += 1
+                if method.startswith("OCR"):
+                    results['ocr_fallback_by_state'][state] += 1
             else:
                 print(f"  ✗ FAILED: No text extracted ({method})")
                 results['failed'] += 1
+                results['failed_by_state'][state] += 1
                 results['errors'].append({
                     'file': str(pdf_path),
                     'error': f'No text extracted ({method})',
@@ -136,6 +154,7 @@ def extract_text_from_all_pdfs(pdf_files, output_dir):
         except Exception as e:
             print(f"  ✗ ERROR: {e}")
             results['failed'] += 1
+            results['failed_by_state'][state] += 1
             results['errors'].append({
                 'file': str(pdf_path),
                 'error': str(e),
@@ -151,6 +170,19 @@ def extract_text_from_all_pdfs(pdf_files, output_dir):
     print(f"Successfully extracted:  {results['successful']}")
     print(f"Already existed:         {results['skipped']}")
     print(f"Failed:                  {results['failed']}")
+    if results['processed_by_state']:
+        print(f"\nNewly extracted by state:")
+        for st, n in sorted(results['processed_by_state'].items(), key=lambda x: (-x[1], x[0])):
+            ocr_n = results['ocr_fallback_by_state'].get(st, 0)
+            print(f"  {st}: {n} ({ocr_n} via OCR fallback)")
+    if results['skipped_by_state']:
+        print(f"\nSkipped by state:")
+        for st, n in sorted(results['skipped_by_state'].items(), key=lambda x: (-x[1], x[0])):
+            print(f"  {st}: {n}")
+    if results['failed_by_state']:
+        print(f"\nFailed by state:")
+        for st, n in sorted(results['failed_by_state'].items(), key=lambda x: (-x[1], x[0])):
+            print(f"  {st}: {n}")
     print(f"\nText files location: {output_path}")
     print(f"{'='*80}\n")
     

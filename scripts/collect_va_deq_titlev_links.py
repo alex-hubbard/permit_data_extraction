@@ -9,6 +9,7 @@ rendering the page, extracting all row data, and writing the results.
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 from typing import List
 
@@ -25,7 +26,10 @@ from scripts.download_va_deq_titlev import (
     BASE_URL,
     PERMIT_LISTING_URL,
     SeleniumPDFDownloader,
-    find_permit_table,
+    find_permit_tables,
+    _extract_pdf_rows_fallback,
+    _find_next_button,
+    _try_select_show_all,
     parse_permit_rows,
 )
 
@@ -46,12 +50,32 @@ def collect_rows(headless: bool = True, wait_seconds: int = 4) -> List[dict]:
         wait = WebDriverWait(driver, 20)
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
 
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        permit_table = find_permit_table(soup)
-        if not permit_table:
-            raise RuntimeError("Could not locate permit table on Virginia DEQ page.")
+        used_show_all = _try_select_show_all(driver)
+        rows = []
+        seen = set()
+        while True:
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            tables = find_permit_tables(soup)
+            page_rows = []
+            for table in tables:
+                page_rows.extend(parse_permit_rows(table))
+            if not page_rows:
+                page_rows = _extract_pdf_rows_fallback(soup)
 
-        rows = parse_permit_rows(permit_table)
+            for row in page_rows:
+                row_key = (str(row.get("link", "")), str(row.get("link_text", "")), str(row))
+                if row_key in seen:
+                    continue
+                seen.add(row_key)
+                rows.append(row)
+
+            if used_show_all:
+                break
+            next_button = _find_next_button(driver)
+            if not next_button:
+                break
+            driver.execute_script("arguments[0].click();", next_button)
+            time.sleep(1.2)
         for row in rows:
             link = row.get("link")
             if link:

@@ -12,11 +12,13 @@ import argparse
 import csv
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Set, Tuple
 from urllib.parse import urljoin
 
+import requests
 from bs4 import BeautifulSoup
 from loguru import logger
 from selenium.webdriver.common.by import By
@@ -34,6 +36,13 @@ SEARCH_URL = "https://openair.wyo.gov/facilities/facilitySearch.jsf"
 class FacilityLink:
     name: str
     url: str
+
+
+@dataclass(frozen=True)
+class DownloadJob:
+    url: str
+    referer: str
+    save_as: str
 
 
 def _normalize_text(value: str) -> str:
@@ -701,6 +710,70 @@ def collect_facility_links(driver, base_url: str, max_pages: int = 10) -> List[F
     return all_links
 
 
+def _next_available_path(output_dir: Path, filename: str) -> Path:
+    candidate = output_dir / filename
+    if not candidate.exists():
+        return candidate
+    stem = candidate.stem
+    suffix = candidate.suffix
+    idx = 2
+    while True:
+        candidate = output_dir / f"{stem}_{idx}{suffix}"
+        if not candidate.exists():
+            return candidate
+        idx += 1
+
+
+def _download_job(job: DownloadJob, output_dir: Path, timeout_seconds: int = 60) -> bool:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+        "Referer": job.referer,
+    }
+    try:
+        with requests.get(job.url, headers=headers, stream=True, timeout=timeout_seconds) as response:
+            if response.status_code >= 400:
+                logger.warning(f"HTTP {response.status_code} while downloading {job.url}")
+                return False
+
+            content_type = (response.headers.get("content-type") or "").lower()
+            if "pdf" not in content_type and ".pdf" not in job.url.lower():
+                logger.warning(f"Non-PDF response for {job.url} (content-type={content_type or 'unknown'})")
+                return False
+
+            target_path = _next_available_path(output_dir, job.save_as)
+            with target_path.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        handle.write(chunk)
+            logger.info(f"Downloaded: {target_path.name} [PARALLEL]")
+            return True
+    except Exception as exc:
+        logger.warning(f"Error downloading {job.url}: {exc}")
+        return False
+
+
+def _download_jobs_in_parallel(jobs: List[DownloadJob], output_dir: Path, workers: int) -> Tuple[int, int]:
+    if not jobs:
+        return 0, 0
+    worker_count = max(1, workers)
+    downloaded = 0
+    failed = 0
+    logger.info(f"Starting parallel download of {len(jobs)} files with {worker_count} workers.")
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(_download_job, job, output_dir) for job in jobs]
+        for future in as_completed(futures):
+            if future.result():
+                downloaded += 1
+            else:
+                failed += 1
+    return downloaded, failed
+
+
 def download_title_v_permits(
     output_dir: Path,
     headless: bool = True,
@@ -708,6 +781,8 @@ def download_title_v_permits(
     max_facilities: Optional[int] = None,
     max_pages: int = 10,
     facility_csv: Optional[Path] = None,
+    download_workers: int = 6,
+    download_batch_size: int = 20,
 ) -> None:
     downloader = SeleniumPDFDownloader(
         output_dir=output_dir,
@@ -764,6 +839,24 @@ def download_title_v_permits(
             logger.info(f"Found {len(facility_links)} facility links to process.")
         downloaded = 0
         skipped = 0
+        download_jobs: List[DownloadJob] = []
+
+        def _flush_download_jobs(force: bool = False) -> None:
+            nonlocal downloaded, skipped, download_jobs
+            if not download_jobs:
+                return
+            if not force and len(download_jobs) < max(1, download_batch_size):
+                return
+            pending_count = len(download_jobs)
+            logger.info(f"Flushing {pending_count} queued download jobs.")
+            run_downloaded, run_failed = _download_jobs_in_parallel(
+                jobs=download_jobs,
+                output_dir=output_dir,
+                workers=download_workers,
+            )
+            downloaded += run_downloaded
+            skipped += run_failed
+            download_jobs = []
 
         if facility_csv:
             search_page_url = driver.current_url
@@ -815,18 +908,18 @@ def download_title_v_permits(
                     skipped += 1
                     continue
 
-                pdf_url, link_text = permit
+                pdf_url, _link_text = permit
                 filename = clean_filename(f"{facility_id} - Title V Final")
-                success = downloader.download_document(
-                    pdf_url,
-                    referer=driver.current_url,
-                    link_text=filename or link_text,
-                    is_table_link=True,
+                if not filename.lower().endswith(".pdf"):
+                    filename = f"{filename}.pdf"
+                download_jobs.append(
+                    DownloadJob(
+                        url=pdf_url,
+                        referer=driver.current_url,
+                        save_as=filename,
+                    )
                 )
-                if success:
-                    downloaded += 1
-                else:
-                    skipped += 1
+                _flush_download_jobs()
         else:
             for idx, facility in enumerate(facility_links, start=1):
                 logger.info(f"[{idx}/{len(facility_links)}] Loading facility: {facility.name}")
@@ -840,20 +933,22 @@ def download_title_v_permits(
                     skipped += 1
                     continue
 
-                for pdf_url, link_text in links:
-                    filename = (
-                        clean_filename(f"{facility.name} - Title V") if facility.name else "wyoming_title_v"
+                for link_idx, (pdf_url, _link_text) in enumerate(links, start=1):
+                    base_name = clean_filename(f"{facility.name} - Title V") if facility.name else "wyoming_title_v"
+                    if len(links) > 1:
+                        base_name = f"{base_name} {link_idx}"
+                    if not base_name.lower().endswith(".pdf"):
+                        base_name = f"{base_name}.pdf"
+                    download_jobs.append(
+                        DownloadJob(
+                            url=pdf_url,
+                            referer=facility.url,
+                            save_as=base_name,
+                        )
                     )
-                    success = downloader.download_document(
-                        pdf_url,
-                        referer=facility.url,
-                        link_text=filename or link_text,
-                        is_table_link=True,
-                    )
-                    if success:
-                        downloaded += 1
-                    else:
-                        skipped += 1
+                    _flush_download_jobs()
+
+        _flush_download_jobs(force=True)
 
         logger.info(f"Downloaded {downloaded} Title V permit PDFs.")
         if skipped:
@@ -903,6 +998,18 @@ def main() -> None:
         default=Path("data/external/facilitySearch.xls.csv"),
         help="CSV file with Facility ID column to search.",
     )
+    parser.add_argument(
+        "--download-workers",
+        type=int,
+        default=6,
+        help="Number of parallel workers for downloading PDFs after links are discovered.",
+    )
+    parser.add_argument(
+        "--download-batch-size",
+        type=int,
+        default=20,
+        help="Flush queued downloads every N discovered files so downloads start before crawl completion.",
+    )
 
     args = parser.parse_args()
     output_dir = args.output_dir.expanduser()
@@ -915,6 +1022,8 @@ def main() -> None:
         max_facilities=args.max_facilities,
         max_pages=args.max_pages,
         facility_csv=args.facility_csv,
+        download_workers=args.download_workers,
+        download_batch_size=args.download_batch_size,
     )
 
 

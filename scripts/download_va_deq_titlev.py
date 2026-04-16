@@ -10,6 +10,7 @@ shared SeleniumPDFDownloader utilities.
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 from typing import List, Optional
 from urllib.parse import urljoin
@@ -17,7 +18,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import Select, WebDriverWait
 
 from permit_data_extraction.config import RAW_DATA_DIR
 from permit_data_extraction.pdf_downloader import SeleniumPDFDownloader, clean_filename
@@ -29,15 +30,19 @@ PERMIT_LISTING_URL = (
 )
 
 
-def find_permit_table(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
+def find_permit_tables(soup: BeautifulSoup) -> List[BeautifulSoup]:
     """
-    Locate the primary Title V permit table by scanning headers for the word 'permit'.
+    Locate permit-related tables by scanning headers for permit/document keywords.
     """
+    matches: List[BeautifulSoup] = []
     for table in soup.find_all("table"):
         headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
-        if headers and any("permit" in header for header in headers):
-            return table
-    return None
+        if headers and any(
+            any(token in header for token in ("permit", "document", "facility", "issued"))
+            for header in headers
+        ):
+            matches.append(table)
+    return matches
 
 
 def parse_permit_rows(table: BeautifulSoup) -> List[dict]:
@@ -57,19 +62,41 @@ def parse_permit_rows(table: BeautifulSoup) -> List[dict]:
         if len(cells) < len(headers):
             cells += [""] * (len(headers) - len(cells))
 
-        link_el = tr.find("a")
-        link = link_el.get("href") if link_el else None
-
         row_data = dict(zip(headers, cells))
-        row_data["link"] = link
-        rows.append(row_data)
+        link_els = tr.find_all("a", href=True)
+        if link_els:
+            for link_el in link_els:
+                row_copy = dict(row_data)
+                row_copy["link"] = link_el.get("href")
+                row_copy["link_text"] = link_el.get_text(strip=True)
+                rows.append(row_copy)
+        else:
+            row_data["link"] = None
+            row_data["link_text"] = ""
+            rows.append(row_data)
 
+    return rows
+
+
+def _extract_pdf_rows_fallback(soup: BeautifulSoup) -> List[dict]:
+    """
+    Fallback parser: capture all PDF/document links on the page.
+    """
+    rows: List[dict] = []
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "").strip()
+        if not href:
+            continue
+        if ".pdf" not in href.lower() and "FileLeafRef=" not in href:
+            continue
+        text = a.get_text(" ", strip=True)
+        rows.append({"Facility Name": text, "link": href, "link_text": text})
     return rows
 
 
 def derive_filename(row: dict) -> str:
     name_parts = []
-    for key in ["Facility Name", "Facility", "Permit Number", "Permit"]:
+    for key in ["Facility Name", "Facility", "Permit Number", "Permit", "link_text"]:
         value = row.get(key)
         if value:
             name_parts.append(value)
@@ -78,6 +105,52 @@ def derive_filename(row: dict) -> str:
         return "virginia_permit"
 
     return clean_filename(" - ".join(name_parts))
+
+
+def _try_select_show_all(driver) -> bool:
+    selectors = ["select[name$='_length']", "select[name*='length']", "label select"]
+    for css in selectors:
+        for element in driver.find_elements(By.CSS_SELECTOR, css):
+            if not element.is_displayed():
+                continue
+            selector = Select(element)
+            for option in selector.options:
+                text = (option.text or "").strip().lower()
+                value = (option.get_attribute("value") or "").strip().lower()
+                if "all" in text or value == "-1":
+                    selector.select_by_visible_text(option.text)
+                    time.sleep(1.0)
+                    return True
+    return False
+
+
+def _find_next_button(driver):
+    candidates = driver.find_elements(
+        By.CSS_SELECTOR,
+        "a.paginate_button.next, a[id$='_next'], a[title='Next'], a[aria-label*='Next']",
+    )
+    for btn in candidates:
+        classes = (btn.get_attribute("class") or "").lower()
+        if "disabled" in classes:
+            continue
+        if btn.is_displayed():
+            return btn
+    return None
+
+
+def _wait_for_listing_content(driver, timeout: int = 30) -> None:
+    """
+    Wait for the page to contain either a table or at least one PDF-like link.
+    """
+    wait = WebDriverWait(driver, timeout)
+    wait.until(
+        lambda d: (
+            len(d.find_elements(By.CSS_SELECTOR, "table")) > 0
+            or len(d.find_elements(By.CSS_SELECTOR, "a[href*='.pdf'], a[href*='FileLeafRef=']")) > 0
+            or "issued-air-permits-for-data-centers" in (d.current_url or "")
+        )
+    )
+    time.sleep(1.2)
 
 
 def download_permits(output_dir: Path, headless: bool = True, wait_seconds: int = 4) -> None:
@@ -92,18 +165,43 @@ def download_permits(output_dir: Path, headless: bool = True, wait_seconds: int 
     try:
         driver = downloader.driver
         driver.get(PERMIT_LISTING_URL)
+        try:
+            _wait_for_listing_content(driver, timeout=max(20, wait_seconds * 5))
+        except Exception:
+            # One retry helps with intermittent first-load rendering/cookie-banner delays.
+            driver.get(PERMIT_LISTING_URL)
+            _wait_for_listing_content(driver, timeout=max(20, wait_seconds * 5))
 
-        wait = WebDriverWait(driver, 20)
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
+        used_show_all = _try_select_show_all(driver)
+        seen_rows = set()
+        rows: List[dict] = []
 
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        permit_table = find_permit_table(soup)
-        if not permit_table:
-            raise RuntimeError("Could not locate permit table on Virginia DEQ page.")
+        while True:
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            tables = find_permit_tables(soup)
+            page_rows: List[dict] = []
+            for table in tables:
+                page_rows.extend(parse_permit_rows(table))
+            if not page_rows:
+                page_rows = _extract_pdf_rows_fallback(soup)
 
-        rows = parse_permit_rows(permit_table)
+            for row in page_rows:
+                row_key = (str(row.get("link", "")), str(row.get("link_text", "")), str(row))
+                if row_key in seen_rows:
+                    continue
+                seen_rows.add(row_key)
+                rows.append(row)
+
+            if used_show_all:
+                break
+            next_button = _find_next_button(driver)
+            if not next_button:
+                break
+            driver.execute_script("arguments[0].click();", next_button)
+            time.sleep(1.2)
+
         if not rows:
-            raise RuntimeError("No permit rows were parsed from the table.")
+            raise RuntimeError("No permit rows were parsed from the Virginia DEQ page.")
 
         downloaded = 0
         skipped = 0

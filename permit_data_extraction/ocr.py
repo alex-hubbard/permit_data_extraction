@@ -1,10 +1,12 @@
 import PyPDF2
 import os
 from pathlib import Path
+from typing import Union
 import logging
 import gc  # Import the garbage collection module
 import shutil
 import time
+from collections import Counter
 
 # OCR specific imports
 try:
@@ -22,6 +24,30 @@ except ImportError:
     pdfinfo_from_path = None
 
 from permit_data_extraction.config import RAW_DATA_DIR, INTERIM_DATA_DIR
+
+
+def atomic_write_text(path: Union[Path, str], text: str, encoding: str = "utf-8") -> None:
+    """
+    Write text to path atomically: write to a same-directory .tmp file, fsync, then os.replace.
+    Avoids leaving a truncated final .txt if the process is interrupted mid-write.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp_path, "w", encoding=encoding) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -44,6 +70,40 @@ POPPLER_PATH_CONFIG = None  # Example: r'C:\poppler-23.08.0\Library\bin'
 # --- OCR Performance Configuration ---
 OCR_CHUNK_SIZE = 5  # Number of pages to process in one OCR batch
 OCR_DPI = 200       # DPI for converting PDF pages to images for OCR
+
+# US states + DC + territories (for path-based jurisdiction labels)
+_US_STATE_CODES = frozenset(
+    "AL AK AZ AR CA CO CT DE DC FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY PR VI GU AS MP".split()
+)
+
+
+def state_code_for_raw_pdf_path(pdf_path: Path, raw_dir: Path) -> str:
+    """
+    Best-effort 2-letter jurisdiction code from a PDF path under data/raw/.
+
+    Recognizes downloaded_pdfs/<ST>/..., epa_final_permits/.../<ST>/..., and ST_*.pdf filenames.
+    """
+    try:
+        rel = pdf_path.resolve().relative_to(raw_dir.resolve())
+    except ValueError:
+        return "unknown"
+    parts = rel.parts
+    if len(parts) >= 2 and parts[0] == "downloaded_pdfs":
+        cand = parts[1].upper()
+        if cand in _US_STATE_CODES:
+            return cand
+    if parts and parts[0] == "epa_final_permits":
+        for seg in parts[1:]:
+            c = seg.upper()
+            if c in _US_STATE_CODES:
+                return c
+    stem = Path(parts[-1]).stem if parts else ""
+    if len(stem) >= 3 and stem[2] == "_" and stem[:2].isalpha():
+        c = stem[:2].upper()
+        if c in _US_STATE_CODES:
+            return c
+    return "unknown"
+
 
 # --- Function Definitions ---
 
@@ -223,8 +283,7 @@ def extract_text_from_single_pdf(pdf_path):
 def save_text_to_file(text_content, output_path):
     """Saves the given text content to a file."""
     try:
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(text_content)
+        atomic_write_text(output_path, text_content)
         logging.info(f"    Successfully saved extracted text to {output_path}")
     except Exception as e:
         logging.error(f"    Error saving text to {output_path}: {e}", exc_info=True)
@@ -310,6 +369,10 @@ def main():
 
     logging.info(f"Found {len(pdf_files)} PDF files to process.")
     summary = []
+    processed_by_state: Counter[str] = Counter()
+    ocr_fallback_by_state: Counter[str] = Counter()
+    skipped_by_state: Counter[str] = Counter()
+    failed_by_state: Counter[str] = Counter()
 
     completed_files = load_completed_text_files(TEXT_OUTPUT_DIR)
 
@@ -318,8 +381,11 @@ def main():
         output_filename = pdf_path.stem + ".txt"
         output_file_path = TEXT_OUTPUT_DIR / output_filename
 
+        state = state_code_for_raw_pdf_path(pdf_path, PDF_INPUT_DIR)
+
         if output_file_path.exists():
             logging.info(f"  Skipping {pdf_path.name}: text already extracted.")
+            skipped_by_state[state] += 1
             summary.append({
                 "filename": pdf_path.name,
                 "status": "Skipped",
@@ -330,6 +396,7 @@ def main():
             continue
         if output_filename in completed_files:
             logging.info(f"  Skipping {pdf_path.name}: already completed in LLM extraction.")
+            skipped_by_state[state] += 1
             summary.append({
                 "filename": pdf_path.name,
                 "status": "Skipped",
@@ -345,6 +412,9 @@ def main():
         if text_content is not None: # Check if text_content is not None
             save_text_to_file(text_content, output_file_path)
             moved_path = move_processed_pdf(pdf_path, PROCESSED_PDF_DIR)
+            processed_by_state[state] += 1
+            if method.startswith("OCR"):
+                ocr_fallback_by_state[state] += 1
             summary.append({
                 "filename": pdf_path.name,
                 "status": "Success",
@@ -354,6 +424,7 @@ def main():
             })
         else:
             logging.warning(f"  No text extracted from {pdf_path.name}. Method: {method}")
+            failed_by_state[state] += 1
             summary.append({"filename": pdf_path.name, "status": "Failed", "method": method, "output_file": None})
         
         # Aggressive garbage collection after each file
@@ -363,6 +434,17 @@ def main():
     logging.info("\n--- Processing Summary ---")
     for item in summary:
         logging.info(f"File: {item['filename']}, Status: {item['status']}, Method: {item['method']}, Output: {item['output_file']}")
+    logging.info("--- Documents by state (newly extracted this run) ---")
+    for st, n in sorted(processed_by_state.items(), key=lambda x: (-x[1], x[0])):
+        logging.info(f"  {st}: {n} extracted ({ocr_fallback_by_state[st]} used OCR)")
+    if skipped_by_state:
+        logging.info("--- Skipped (already had text / completed) by state ---")
+        for st, n in sorted(skipped_by_state.items(), key=lambda x: (-x[1], x[0])):
+            logging.info(f"  {st}: {n}")
+    if failed_by_state:
+        logging.info("--- Failed by state ---")
+        for st, n in sorted(failed_by_state.items(), key=lambda x: (-x[1], x[0])):
+            logging.info(f"  {st}: {n}")
     logging.info("PDF to Text conversion process finished.")
 
 if __name__ == "__main__":
