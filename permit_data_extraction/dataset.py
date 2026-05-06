@@ -68,14 +68,14 @@ def get_run_output_excel_path():
 # Save tuning
 SAVE_EVERY_N_FILES = 100  # Reduce Excel IO by batching writes
 # LLM concurrency tuning
-LLM_MAX_WORKERS = 5  # CBORG max parallel requests
+LLM_MAX_WORKERS = 4
 
 # Feature flags
 ENABLE_SPEC_SHEET_LOOKUP = False
 
 # LLM model configuration
-LLM_MODEL = "lbl/llama" #"gemini-2.0-flash-lite"  # 1M context, $0.10/1M input tokens
-LLM_LARGE_MODEL = os.getenv("LLM_LARGE_MODEL", "lbl/gpt-oss-120b-high")  # Paid, 1M context — fallback for large docs
+LLM_MODEL = "gemini-2.0-flash-lite"  # 1M context, $0.10/1M input tokens
+LLM_LARGE_MODEL = os.getenv("LLM_LARGE_MODEL", "gemini-2.0-flash-lite")  # 1M context — fallback for docs that exceed primary model context
 
 
 def _env_flag(name: str, default: bool = True) -> bool:
@@ -397,8 +397,16 @@ def _digits_naics(val) -> str:
 
 
 def is_manufacturing_naics_3133(val) -> bool:
-    """True if NAICS code is in sectors 31, 32, or 33 (manufacturing)."""
+    """True if the code is manufacturing under NAICS (sectors 31/32/33) or SIC (2000-3999).
+
+    The classification column may contain either NAICS or SIC codes. SIC codes are
+    always exactly 4 digits; longer codes are treated as NAICS.
+    """
     d = _digits_naics(val)
+    if not d:
+        return False
+    if len(d) == 4:
+        return d[0] in ("2", "3")
     if len(d) >= 2:
         return d[:2] in ("31", "32", "33")
     return False
@@ -595,6 +603,22 @@ def postprocess_extraction_row(row: dict) -> dict:
     return out
 
 
+# Mirrors openpyxl.cell.cell.ILLEGAL_CHARACTERS_RE: ASCII control chars Excel rejects.
+# Stripping these before write prevents IllegalCharacterError from aborting whole-workbook writes.
+_OPENPYXL_ILLEGAL_CHARS_RE = re.compile(r"[\000-\010]|[\013-\014]|[\016-\037]")
+
+
+def _sanitize_for_openpyxl(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip control chars from string cells so openpyxl won't raise IllegalCharacterError."""
+    out = df.copy()
+    for col in out.columns:
+        if out[col].dtype == object:
+            out[col] = out[col].map(
+                lambda v: _OPENPYXL_ILLEGAL_CHARS_RE.sub("", v) if isinstance(v, str) else v
+            )
+    return out
+
+
 def dataframe_with_excel_headers(df: pd.DataFrame) -> pd.DataFrame:
     """Return a copy with analyst-facing column labels for Excel."""
     out = df.copy()
@@ -638,18 +662,59 @@ def write_permit_excel_multisheet(df: pd.DataFrame, path, column_order: list):
     for col in column_order:
         if col not in df.columns:
             df[col] = None
-    df = df[column_order]
+    classified_col = "Classified NAICS"
+    df = df[column_order + ([classified_col] if classified_col in df.columns else [])]
 
-    mfg = df[df["NAICS Code"].apply(is_manufacturing_naics_3133)].copy()
-    other = df[~df["NAICS Code"].apply(is_manufacturing_naics_3133)].copy()
+    from permit_data_extraction.industry_description_classifier import (
+        classify_industry_to_naics,
+    )
+
+    # The "Manufacturing" tab covers the four manufacturing-sector groupings:
+    # NAICS 31/32/33 (traditional manufacturing) plus the three industrial-
+    # process sectors that share emission-source characteristics:
+    #   - Data Centers  (NAICS 518210)
+    #   - Water         (NAICS 221310)
+    #   - Wastewater    (NAICS 221320)
+    extra_mfg_naics = {"518210", "221310", "221320"}
+    extra_mfg_sic = {"7374", "4941", "4952"}
+
+    def _code_is_mfg_tab(code) -> bool:
+        if is_manufacturing_naics_3133(code):
+            return True
+        digits = re.sub(r"\D", "", str(code or ""))
+        if not digits:
+            return False
+        return digits in extra_mfg_naics or digits in extra_mfg_sic
+
+    desc_codes = (
+        df["Industry Description"].apply(classify_industry_to_naics)
+        if "Industry Description" in df.columns
+        else pd.Series([None] * len(df), index=df.index)
+    )
+    df[classified_col] = desc_codes
+    desc_is_mfg = desc_codes.apply(lambda c: bool(c) and _code_is_mfg_tab(c))
+    desc_is_non_mfg = desc_codes.notna() & ~desc_is_mfg
+
+    naics_is_mfg = df["NAICS Code"].apply(_code_is_mfg_tab)
+    if "SIC Code" in df.columns:
+        sic_is_mfg = df["SIC Code"].apply(_code_is_mfg_tab)
+        code_is_mfg = naics_is_mfg | sic_is_mfg
+    else:
+        code_is_mfg = naics_is_mfg
+
+    # Industry Description is primary; NAICS/SIC code is the fallback when
+    # the description didn't match any rule.
+    mfg_mask = desc_is_mfg | (~desc_is_non_mfg & code_is_mfg)
+    mfg = df[mfg_mask].copy()
+    other = df[~mfg_mask].copy()
 
     sort_cols = [c for c in ("NAICS Code", "Filename") if c in df.columns]
     if sort_cols:
         mfg = mfg.sort_values(by=sort_cols, na_position="last")
         other = other.sort_values(by=sort_cols, na_position="last")
 
-    mfg_out = dataframe_with_excel_headers(mfg)
-    other_out = dataframe_with_excel_headers(other)
+    mfg_out = _sanitize_for_openpyxl(dataframe_with_excel_headers(mfg))
+    other_out = _sanitize_for_openpyxl(dataframe_with_excel_headers(other))
 
     # Atomic write: write to a temp file in the same directory, then rename.
     # This prevents corruption if the process crashes mid-write.
@@ -1552,9 +1617,10 @@ def read_text_from_file(file_path):
 # Rough chars-per-token ratio for English text; used to estimate prompt overhead.
 _CHARS_PER_TOKEN = 4
 
-# Default: ~100 000 chars ≈ 25k tokens — fits comfortably in 32k-context models
-# once the prompt template (~3k tokens) and response budget (~2k tokens) are subtracted.
-DEFAULT_MAX_CHUNK_CHARS = 100_000
+# Target the 131,072-token context of GPT-oss-120B with a 32,768-token output budget:
+# 131,072 total − 32,768 completion − ~2,537 prompt template − ~2,000 safety margin
+# ≈ 93,767 tokens for text. At ~3.5 chars/token conservative, that's ~328k chars.
+DEFAULT_MAX_CHUNK_CHARS = 320_000
 CHUNK_OVERLAP_CHARS = 4_000  # overlap to avoid splitting a unit description in half
 
 
@@ -1665,6 +1731,7 @@ def _is_token_limit_error(error):
         or ("context" in message and "token" in message)
         or "max_tokens must be at least 1" in message  # CBORG proxy: input exceeds context window
         or ("max_tokens" in message and "got -" in message)  # CBORG proxy: negative max_tokens
+        or "finish_reason=length" in message  # output truncated at provider's max output tokens
     )
     if not result:
         logging.info(f"  _is_token_limit_error=False for: {message[:300]}")
@@ -1712,7 +1779,7 @@ def _invoke_llm_for_model(client, prompt, filename, model_name):
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,
-                max_tokens=8192,
+                max_tokens=32768,
                 timeout=60,
                 response_format={"type": "json_object"}
             )
@@ -1735,8 +1802,24 @@ def _invoke_llm_for_model(client, prompt, filename, model_name):
         logging.error(f"  LLM response was empty or malformed for {filename}.")
         return None, "Empty or malformed response"
 
+    choice = response.choices[0]
+    content = getattr(choice.message, "content", None)
+    finish_reason = getattr(choice, "finish_reason", "unknown")
+    if content is None:
+        logging.warning(f"  LLM returned no content for {filename} (finish_reason={finish_reason}).")
+        return None, f"Empty content (finish_reason={finish_reason})"
+
+    # finish_reason="length" means the model hit the output-token cap and the JSON is
+    # truncated mid-emission. Surface as a token-limit error so the chunking path picks it up.
+    if finish_reason == "length":
+        logging.warning(
+            f"  Output truncated for {filename} (finish_reason=length, {len(content)} chars). "
+            f"Will route to chunking."
+        )
+        return None, "Output truncated (finish_reason=length)"
+
     try:
-        json_text_response = response.choices[0].message.content.strip()
+        json_text_response = content.strip()
         if "```json" in json_text_response:
             json_text_response = json_text_response.split("```json")[1].split("```")[0].strip()
         elif "```" in json_text_response:
@@ -2506,22 +2589,17 @@ def main(
                 files_since_save += 1
 
                 if files_since_save >= SAVE_EVERY_N_FILES:
-                    try:
-                        write_permit_excel_multisheet(output_df, run_output_file, excel_columns)
-                        logging.info(f"  Wrote batch to run Excel after {files_since_save} files")
-                        files_since_save = 0
-                    except Exception as e:
-                        logging.error(f"Error writing batch to Excel: {e}", exc_info=True)
+                    # Fail loudly: a swallowed write error means subsequent batches also
+                    # silently fail and the in-memory rows are lost when the run ends.
+                    write_permit_excel_multisheet(output_df, run_output_file, excel_columns)
+                    logging.info(f"  Wrote batch to run Excel after {files_since_save} files")
+                    files_since_save = 0
 
     # Add spec sheet links if enabled (rows are already saved incrementally)
     if processed_data_rows:
-        try:
-            write_permit_excel_multisheet(output_df, run_output_file, excel_columns)
-            logging.info(f"Final Excel write complete (run file): {run_output_file}")
-            combine_run_into_combined(run_output_file, excel_columns)
-        except Exception as e:
-            logging.error(f"Error writing final Excel file: {e}", exc_info=True)
-            print(f"  Warning: Failed to save final Excel: {e}")
+        write_permit_excel_multisheet(output_df, run_output_file, excel_columns)
+        logging.info(f"Final Excel write complete (run file): {run_output_file}")
+        combine_run_into_combined(run_output_file, excel_columns)
 
     if processed_data_rows and ENABLE_SPEC_SHEET_LOOKUP:
         logging.info(f"\nAdding spec sheet links to existing Excel file...")
@@ -2709,8 +2787,13 @@ def _parse_llm_json_response(response):
     """Parse a JSON extraction response from the LLM. Returns (data, error_str)."""
     if not response or not response.choices:
         return None, "empty response"
+    choice = response.choices[0]
+    if getattr(choice, "finish_reason", None) == "length":
+        # Output truncated at provider's max-output cap; JSON is incomplete.
+        # Surface as token-limit error so the chunking path picks it up.
+        return None, "Output truncated (finish_reason=length)"
     try:
-        json_text = response.choices[0].message.content.strip()
+        json_text = choice.message.content.strip()
         if "```json" in json_text:
             json_text = json_text.split("```json")[1].split("```")[0].strip()
         elif "```" in json_text:
@@ -2769,7 +2852,7 @@ async def _async_extract_one(
                         model=model_name,
                         messages=messages,
                         temperature=0.1,
-                        max_tokens=8192,
+                        max_tokens=32768,
                         timeout=120,
                         response_format={"type": "json_object"},
                     )
@@ -2794,6 +2877,9 @@ async def _async_extract_one(
             pbar.update(1)
             return original_filename, extracted_data, "success", model_used
         logging.error(f"  JSON parse error for {original_filename}: {parse_err}")
+        # Forward parse-time token-limit signals (e.g. truncated output) to the chunking dispatch.
+        if not error_str:
+            error_str = parse_err
 
     # --- 2. Chunked extraction (same small model) ---
     if error_str and _is_token_limit_error(error_str):
@@ -2943,18 +3029,16 @@ async def _run_async_batch(text_files, allow_large_model_retry, concurrency,
 
         _update_pbar_stats()
 
-        # Incremental Excel save
+        # Incremental Excel save — fail loudly so a write error doesn't silently
+        # discard rows accumulated in state["output_df"].
         state["files_since_save"] += 1
         if state["files_since_save"] >= SAVE_EVERY_N_FILES:
-            try:
-                await asyncio.to_thread(
-                    write_permit_excel_multisheet,
-                    state["output_df"], run_output_file, excel_columns,
-                )
-                logging.info(f"Incremental save: {state['success_count']} successes so far")
-                state["files_since_save"] = 0
-            except Exception as e:
-                logging.error(f"Error during incremental Excel save: {e}", exc_info=True)
+            await asyncio.to_thread(
+                write_permit_excel_multisheet,
+                state["output_df"], run_output_file, excel_columns,
+            )
+            logging.info(f"Incremental save: {state['success_count']} successes so far")
+            state["files_since_save"] = 0
 
     tasks = [_extract_and_save(txt_path) for txt_path in text_files]
     await asyncio.gather(*tasks, return_exceptions=True)

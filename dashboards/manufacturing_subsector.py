@@ -1,0 +1,635 @@
+"""Interactive dashboard for exploring manufacturing subsectors in the permit dataset.
+
+Run with:
+    streamlit run dashboards/manufacturing_subsector.py
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "processed" / "permit_data_extracted.xlsx"
+FRS_FACILITIES_PATH = PROJECT_ROOT / "data" / "external" / "FRS_FACILITIES.csv"
+SHEET_NAMES = ("Manufacturing NAICS 31-33", "Other NAICS")
+
+# Special non-NAICS option codes used by the subsector selector.
+ALL_CODE = "ALL"
+DATA_CENTER_CODE = "DATA_CENTER"
+WATER_CODE = "WATER"
+WASTEWATER_CODE = "WASTEWATER"
+
+# Keyword regexes (case-insensitive) applied to Industry Description and
+# Facility Name to identify rows for non-NAICS virtual subsectors. These
+# sectors are typically classified under a power-generation NAICS (e.g. 221112
+# for backup generators), so NAICS alone is not enough to find them.
+KEYWORD_FILTERS = {
+    DATA_CENTER_CODE: re.compile(
+        r"\bdata\s*cent(?:er|re)s?\b|\bcolocation\b|\bhyperscale\b", re.IGNORECASE
+    ),
+    WATER_CODE: re.compile(
+        r"\bwater\s+(?:treatment|plant|supply|distribution|district|utility|authority)\b"
+        r"|\bdrinking\s+water\b|\bpotable\s+water\b",
+        re.IGNORECASE,
+    ),
+    WASTEWATER_CODE: re.compile(
+        r"\bwastewater\b|\bsewage\b|\bsanitary\s+sewer\b"
+        r"|\bpublicly\s+owned\s+treatment\b|\bWWTP\b|\bPOTW\b",
+        re.IGNORECASE,
+    ),
+}
+
+# 3-digit NAICS subsector labels (manufacturing 31-33).
+NAICS_SUBSECTOR_LABELS = {
+    "311": "Food Manufacturing",
+    "312": "Beverage and Tobacco Product",
+    "313": "Textile Mills",
+    "314": "Textile Product Mills",
+    "315": "Apparel",
+    "316": "Leather and Allied Product",
+    "321": "Wood Product",
+    "322": "Paper",
+    "323": "Printing and Related Support",
+    "324": "Petroleum and Coal Products",
+    "325": "Chemical",
+    "326": "Plastics and Rubber Products",
+    "327": "Nonmetallic Mineral Product",
+    "331": "Primary Metal",
+    "332": "Fabricated Metal Product",
+    "333": "Machinery",
+    "334": "Computer and Electronic Product",
+    "335": "Electrical Equipment, Appliance, and Component",
+    "336": "Transportation Equipment",
+    "337": "Furniture and Related Product",
+    "339": "Miscellaneous",
+}
+
+# Canonical capacity-unit normalization. Keys are lowercased/stripped strings.
+CAPACITY_UNIT_NORMALIZATION = {
+    "mmbtu/hr": "MMBtu/hr",
+    "mmbtu per hour": "MMBtu/hr",
+    "mmbtuhr": "MMBtu/hr",
+    "mmbtu/h": "MMBtu/hr",
+    "mmbtu hr": "MMBtu/hr",
+    "lb/hr": "lb/hr",
+    "lbs/hr": "lb/hr",
+    "pounds per hour": "lb/hr",
+    "pounds/hour": "lb/hr",
+    "lbs/hour": "lb/hr",
+    "tons/hr": "tons/hr",
+    "tons/hour": "tons/hr",
+    "tons per hour": "tons/hr",
+    "ton/hr": "tons/hr",
+    "tph": "tons/hr",
+    "hp": "HP",
+    "horsepower": "HP",
+    "bhp": "BHP",
+    "kw": "kW",
+    "mw": "MW",
+    "gallons": "gallons",
+    "gal": "gallons",
+    "mcf/hr": "MCF/hr",
+    "scfm": "SCFM",
+    "acfm": "ACFM",
+}
+
+
+def _norm_token(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def _normalize_capacity_unit(value: object) -> str | None:
+    if pd.isna(value):
+        return None
+    token = _norm_token(str(value))
+    return CAPACITY_UNIT_NORMALIZATION.get(token, str(value).strip())
+
+
+def _normalize_fuel(value: object) -> str | None:
+    if pd.isna(value):
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    return s[:1].upper() + s[1:].lower() if s.isalpha() else s.title()
+
+
+def _digits_only(value: object) -> str | None:
+    if pd.isna(value):
+        return None
+    s = re.sub(r"\D", "", str(value))
+    return s or None
+
+
+@st.cache_data(show_spinner="Loading FRS city centroids…")
+def load_city_centroids(path: Path) -> pd.DataFrame:
+    """Median lat/lon per (state, city) from EPA FRS, used to plot facility points.
+
+    FRS coordinates are at the facility level; collapsing to city centroids gives
+    ~99% coverage of our sites without needing fuzzy name matching. Multiple
+    facilities in one city stack on the same point.
+    """
+    if not path.exists():
+        return pd.DataFrame(columns=["key_state", "key_city", "Lat", "Lon"])
+    frs = pd.read_csv(
+        path,
+        dtype=str,
+        usecols=["FAC_CITY", "FAC_STATE", "LATITUDE_MEASURE", "LONGITUDE_MEASURE"],
+    )
+    frs["Lat"] = pd.to_numeric(frs["LATITUDE_MEASURE"], errors="coerce")
+    frs["Lon"] = pd.to_numeric(frs["LONGITUDE_MEASURE"], errors="coerce")
+    frs = frs.dropna(subset=["Lat", "Lon", "FAC_CITY", "FAC_STATE"])
+    frs = frs[
+        frs["Lat"].between(17, 72)
+        & frs["Lon"].between(-180, -65)
+        & (frs["Lat"] != 0)
+    ]
+    frs["key_state"] = frs["FAC_STATE"].str.upper().str.strip()
+    frs["key_city"] = frs["FAC_CITY"].str.upper().str.strip()
+    centroids = (
+        frs.groupby(["key_state", "key_city"])[["Lat", "Lon"]].median().reset_index()
+    )
+    return centroids
+
+
+@st.cache_data(show_spinner="Loading permit dataset…")
+def load_data(path: Path, centroids_path: Path) -> pd.DataFrame:
+    sheets = []
+    for sheet in SHEET_NAMES:
+        try:
+            s = pd.read_excel(path, sheet_name=sheet, dtype=str)
+        except ValueError:
+            continue
+        s["Source Sheet"] = sheet
+        sheets.append(s)
+    df = pd.concat(sheets, ignore_index=True)
+
+    # Pick the most reliable NAICS: prefer Classified NAICS (full 6-digit),
+    # fall back to the raw NAICS Code from the permit. The "Other NAICS" sheet
+    # has no Classified NAICS column, so handle that gracefully.
+    classified = (
+        df["Classified NAICS"].apply(_digits_only)
+        if "Classified NAICS" in df.columns
+        else pd.Series([None] * len(df), index=df.index)
+    )
+    raw = df["NAICS Code"].apply(_digits_only)
+    naics = classified.where(classified.notna(), raw)
+    df["NAICS_clean"] = naics
+    df["Subsector"] = naics.str[:3]
+
+    # Tag rows that match keyword-based virtual subsectors (data center,
+    # water, wastewater). A row can match multiple — store as a set per row
+    # for flexible filtering.
+    text_cols = []
+    for c in ("Industry Description", "Facility Name"):
+        if c in df.columns:
+            text_cols.append(df[c].fillna(""))
+    haystack = (
+        text_cols[0].str.cat(text_cols[1:], sep=" ")
+        if text_cols
+        else pd.Series([""] * len(df), index=df.index)
+    )
+    for code, pattern in KEYWORD_FILTERS.items():
+        df[f"is_{code}"] = haystack.str.contains(pattern)
+
+    # Site key: facility + city + state (best available stable identifier).
+    df["Site Key"] = (
+        df["Facility Name"].fillna("").str.strip().str.upper()
+        + " | "
+        + df["Facility City"].fillna("").str.strip().str.upper()
+        + " | "
+        + df["Facility State Abbreviation"].fillna("").str.strip().str.upper()
+    )
+
+    # Numeric capacity (best-effort) and normalized unit.
+    df["Capacity Value (num)"] = pd.to_numeric(df["Capacity Value"], errors="coerce")
+    df["Capacity Unit (norm)"] = df["Capacity Unit"].apply(_normalize_capacity_unit)
+    df["Fuel Type (norm)"] = df["Fuel Type"].apply(_normalize_fuel)
+    df["Unit Quantity (num)"] = pd.to_numeric(df["Unit Quantity"], errors="coerce")
+
+    # Attach city-centroid coordinates for points-on-map view.
+    centroids = load_city_centroids(centroids_path)
+    df["key_state"] = df["Facility State Abbreviation"].str.upper().str.strip()
+    df["key_city"] = df["Facility City"].str.upper().str.strip()
+    df = df.merge(centroids, on=["key_state", "key_city"], how="left")
+
+    return df
+
+
+def _all_mask(df: pd.DataFrame) -> pd.Series:
+    """Rows in the 'All facilities' scope: manufacturing 31-33 ∪ data center ∪ water ∪ wastewater."""
+    mask = df["Subsector"].isin(NAICS_SUBSECTOR_LABELS)
+    for code in KEYWORD_FILTERS:
+        mask = mask | df[f"is_{code}"]
+    return mask
+
+
+def filter_by_option(df: pd.DataFrame, code: str) -> pd.DataFrame:
+    """Apply the dropdown selection to the dataframe."""
+    if code == ALL_CODE:
+        return df[_all_mask(df)]
+    if code in KEYWORD_FILTERS:
+        return df[df[f"is_{code}"]]
+    return df[df["Subsector"] == code]
+
+
+def option_row_count(df: pd.DataFrame, code: str) -> int:
+    if code == ALL_CODE:
+        return int(_all_mask(df).sum())
+    if code in KEYWORD_FILTERS:
+        return int(df[f"is_{code}"].sum())
+    return int((df["Subsector"] == code).sum())
+
+
+def subsector_options(df: pd.DataFrame) -> list[tuple[str, str]]:
+    """Return (code, label) pairs for the dropdown.
+
+    Order: All facilities → keyword virtual subsectors → NAICS 31-33 subsectors.
+    Each label includes the row count for the option.
+    """
+    items: list[tuple[str, str]] = []
+
+    items.append((ALL_CODE, f"All facilities  ({option_row_count(df, ALL_CODE):,} units)"))
+
+    virtual = [
+        (DATA_CENTER_CODE, "Data centers"),
+        (WATER_CODE, "Water treatment / supply"),
+        (WASTEWATER_CODE, "Wastewater / sewage"),
+    ]
+    for code, label in virtual:
+        items.append((code, f"{label}  ({option_row_count(df, code):,} units)"))
+
+    counts = df["Subsector"].value_counts()
+    for code in sorted(c for c in counts.index if c in NAICS_SUBSECTOR_LABELS):
+        label = NAICS_SUBSECTOR_LABELS[code]
+        items.append((code, f"{code} — {label}  ({counts[code]:,} units)"))
+    return items
+
+
+def option_display_name(code: str) -> str:
+    if code == ALL_CODE:
+        return "All facilities"
+    if code == DATA_CENTER_CODE:
+        return "Data centers"
+    if code == WATER_CODE:
+        return "Water treatment / supply"
+    if code == WASTEWATER_CODE:
+        return "Wastewater / sewage"
+    if code in NAICS_SUBSECTOR_LABELS:
+        return f"{code} — {NAICS_SUBSECTOR_LABELS[code]}"
+    return code
+
+
+def kpi_row(sub: pd.DataFrame) -> None:
+    facilities = sub["Site Key"].nunique()
+    units = len(sub)
+    states = sub["Facility State Abbreviation"].nunique()
+    units_per_site = sub.groupby("Site Key").size()
+    median_units = float(units_per_site.median()) if len(units_per_site) else 0.0
+    permits = sub["Permit Number"].nunique() if "Permit Number" in sub.columns else 0
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Facilities (sites)", f"{facilities:,}")
+    c2.metric("Permits", f"{permits:,}")
+    c3.metric("Emission units", f"{units:,}")
+    c4.metric("States represented", f"{states}")
+    c5.metric("Median units / site", f"{median_units:.0f}")
+
+
+def _primary_bucket(sub: pd.DataFrame) -> pd.Series:
+    """One subsector label per row. Keyword-tagged rows take precedence over
+    the NAICS 3-digit bucket so a manufacturing-classified backup-generator at
+    a data center gets counted as 'Data centers'.
+    """
+    label = pd.Series(index=sub.index, dtype="object")
+    # NAICS bucket first (lowest priority).
+    naics_label = sub["Subsector"].map(
+        lambda c: f"{c} — {NAICS_SUBSECTOR_LABELS[c]}" if c in NAICS_SUBSECTOR_LABELS else None
+    )
+    label = label.where(label.notna(), naics_label)
+    # Keyword tags overwrite (highest priority: data center, then water, then wastewater).
+    for code, name in (
+        (WASTEWATER_CODE, "Wastewater / sewage"),
+        (WATER_CODE, "Water treatment / supply"),
+        (DATA_CENTER_CODE, "Data centers"),
+    ):
+        flag = sub[f"is_{code}"]
+        label = label.where(~flag, name)
+    return label
+
+
+def chart_subsector_pie(sub: pd.DataFrame) -> None:
+    """Pie of subsector composition for the All-facilities scope."""
+    bucket = _primary_bucket(sub)
+    counts = (
+        bucket.dropna()
+        .value_counts()
+        .rename_axis("Subsector")
+        .reset_index(name="units")
+    )
+    if counts.empty:
+        st.info("No rows to summarize.")
+        return
+    fig = px.pie(
+        counts,
+        names="Subsector",
+        values="units",
+        hole=0.35,
+    )
+    fig.update_traces(
+        textposition="inside",
+        textinfo="percent+label",
+        sort=True,
+    )
+    fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=460, showlegend=True)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def chart_state_distribution(sub: pd.DataFrame, uniform_markers: bool = False) -> None:
+    sites = (
+        sub.groupby("Site Key")
+        .agg(
+            facility=("Facility Name", "first"),
+            city=("Facility City", "first"),
+            state=("Facility State Abbreviation", "first"),
+            units=("Site Key", "size"),
+            lat=("Lat", "first"),
+            lon=("Lon", "first"),
+        )
+        .reset_index(drop=True)
+    )
+    plotted = sites.dropna(subset=["lat", "lon"])
+
+    map_col, bar_col = st.columns([1.4, 1])
+    with map_col:
+        if plotted.empty:
+            st.info("No facilities resolved to coordinates for this subsector.")
+        else:
+            if uniform_markers:
+                fig_map = px.scatter_geo(
+                    plotted,
+                    lat="lat",
+                    lon="lon",
+                    scope="usa",
+                    hover_name="facility",
+                    hover_data={
+                        "city": True,
+                        "state": True,
+                        "units": True,
+                        "lat": False,
+                        "lon": False,
+                    },
+                    opacity=0.55,
+                )
+                fig_map.update_traces(
+                    marker=dict(size=4, color="#1f77b4", line=dict(width=0))
+                )
+            else:
+                fig_map = px.scatter_geo(
+                    plotted,
+                    lat="lat",
+                    lon="lon",
+                    scope="usa",
+                    size="units",
+                    size_max=22,
+                    color="units",
+                    color_continuous_scale="Viridis",
+                    hover_name="facility",
+                    hover_data={
+                        "city": True,
+                        "state": True,
+                        "units": True,
+                        "lat": False,
+                        "lon": False,
+                    },
+                    opacity=0.7,
+                )
+                fig_map.update_traces(marker=dict(line=dict(width=0)))
+            fig_map.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=420)
+            st.plotly_chart(fig_map, use_container_width=True)
+            missing = len(sites) - len(plotted)
+            base_caption = (
+                f"{len(plotted):,} of {len(sites):,} sites plotted"
+                + (f" — {missing:,} could not be geocoded" if missing else "")
+                + ". Points are FRS city centroids; co-located facilities overlap."
+            )
+            st.caption(base_caption)
+
+    with bar_col:
+        by_state = (
+            sites.dropna(subset=["state"])
+            .groupby("state")
+            .agg(facilities=("facility", "nunique"), units=("units", "sum"))
+            .reset_index()
+            .sort_values("facilities", ascending=False)
+        )
+        if by_state.empty:
+            st.info("No state-level data available.")
+            return
+        top = by_state.head(15).iloc[::-1]
+        fig_bar = px.bar(
+            top,
+            x="facilities",
+            y="state",
+            orientation="h",
+            labels={"facilities": "Facilities", "state": "State"},
+            hover_data={"units": True},
+        )
+        fig_bar.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=420)
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+
+def chart_units_per_site(sub: pd.DataFrame) -> None:
+    units_per_site = sub.groupby("Site Key").size().rename("units").reset_index()
+    if units_per_site.empty:
+        return
+    cap = int(units_per_site["units"].quantile(0.99))
+    cap = max(cap, 5)
+    fig = px.histogram(
+        units_per_site,
+        x="units",
+        nbins=min(50, cap),
+        range_x=(0, cap),
+        labels={"units": "Emission units per site"},
+    )
+    p50 = int(units_per_site["units"].median())
+    p90 = int(units_per_site["units"].quantile(0.9))
+    fig.add_vline(x=p50, line_dash="dash", annotation_text=f"median={p50}")
+    fig.add_vline(x=p90, line_dash="dot", annotation_text=f"p90={p90}")
+    fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=320, bargap=0.05)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _top_counts(series: pd.Series, n: int) -> pd.DataFrame:
+    counts = series.dropna().astype(str).str.strip()
+    counts = counts[counts != ""]
+    if counts.empty:
+        return pd.DataFrame(columns=["value", "count"])
+    return (
+        counts.value_counts()
+        .head(n)
+        .rename_axis("value")
+        .reset_index(name="count")
+    )
+
+
+def chart_top_categorical(
+    sub: pd.DataFrame, column: str, title: str, n: int = 15
+) -> None:
+    top = _top_counts(sub[column], n)
+    if top.empty:
+        st.info(f"No data for {title.lower()}.")
+        return
+    fig = px.bar(
+        top.iloc[::-1],
+        x="count",
+        y="value",
+        orientation="h",
+        labels={"value": title, "count": "Units"},
+    )
+    fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=380)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def chart_capacity_distribution(sub: pd.DataFrame) -> None:
+    cap = sub.dropna(subset=["Capacity Value (num)", "Capacity Unit (norm)"]).copy()
+    if cap.empty:
+        st.info("No capacity data populated for this subsector.")
+        return
+
+    unit_counts = cap["Capacity Unit (norm)"].value_counts()
+    common_units = unit_counts.head(8).index.tolist()
+    selected = st.multiselect(
+        "Capacity units to compare",
+        options=common_units,
+        default=common_units[: min(4, len(common_units))],
+        help="Capacity is reported in many units; pick a comparable set.",
+    )
+    plot_df = cap[cap["Capacity Unit (norm)"].isin(selected)]
+    if plot_df.empty:
+        st.info("Pick at least one capacity unit to plot.")
+        return
+    plot_df = plot_df[plot_df["Capacity Value (num)"] > 0]
+    fig = px.box(
+        plot_df,
+        x="Capacity Unit (norm)",
+        y="Capacity Value (num)",
+        log_y=True,
+        labels={
+            "Capacity Unit (norm)": "Capacity unit",
+            "Capacity Value (num)": "Capacity (log scale)",
+        },
+        points="suspectedoutliers",
+    )
+    fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=360)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_data_table(sub: pd.DataFrame) -> None:
+    cols = [
+        "Facility Name",
+        "Facility City",
+        "Facility State Abbreviation",
+        "NAICS_clean",
+        "Industry Description",
+        "Unit Description",
+        "Unit Type",
+        "Capacity Value (num)",
+        "Capacity Unit (norm)",
+        "Fuel Type (norm)",
+        "Control Device(s)",
+        "Permit Number",
+    ]
+    cols = [c for c in cols if c in sub.columns]
+    st.dataframe(sub[cols].head(500), use_container_width=True, height=320)
+    st.caption(f"Showing first 500 of {len(sub):,} rows in subsector.")
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Permit Subsector Dashboard",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    st.title("Permit Subsector Dashboard")
+
+    with st.sidebar:
+        st.header("Data")
+        data_path_str = st.text_input(
+            "Dataset path",
+            value=str(DEFAULT_DATA_PATH),
+            help="Path to permit_data_extracted.xlsx",
+        )
+        data_path = Path(data_path_str)
+        if not data_path.exists():
+            st.error(f"File not found: {data_path}")
+            st.stop()
+
+    df = load_data(data_path, FRS_FACILITIES_PATH)
+    options = subsector_options(df)
+    if not options:
+        st.error("No subsector rows found in the dataset.")
+        st.stop()
+
+    with st.sidebar:
+        st.header("Subsector")
+        labels = [label for _, label in options]
+        codes = [code for code, _ in options]
+        choice = st.selectbox("Subsector", labels, index=0)
+        chosen_code = codes[labels.index(choice)]
+
+        st.header("Filters")
+        states_available = sorted(df["Facility State Abbreviation"].dropna().unique())
+        state_filter = st.multiselect("States", options=states_available, default=[])
+
+    sub = filter_by_option(df, chosen_code)
+    if state_filter:
+        sub = sub[sub["Facility State Abbreviation"].isin(state_filter)]
+
+    st.subheader(option_display_name(chosen_code))
+    if sub.empty:
+        st.warning("No rows match the current filters.")
+        return
+
+    kpi_row(sub)
+
+    if chosen_code == ALL_CODE:
+        st.markdown("### Subsector composition")
+        chart_subsector_pie(sub)
+
+    st.markdown("### Geographic distribution")
+    chart_state_distribution(sub, uniform_markers=(chosen_code == ALL_CODE))
+
+    st.markdown("### Units per site")
+    chart_units_per_site(sub)
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("### Top unit types")
+        chart_top_categorical(sub, "Unit Type", "Unit type", n=15)
+    with right:
+        st.markdown("### Top fuel types")
+        chart_top_categorical(sub, "Fuel Type (norm)", "Fuel type", n=15)
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("### Top control devices")
+        chart_top_categorical(sub, "Control Device(s)", "Control device", n=15)
+    with right:
+        st.markdown("### Top industry descriptions")
+        chart_top_categorical(sub, "Industry Description", "Industry description", n=15)
+
+    st.markdown("### Capacity distribution by reported unit")
+    chart_capacity_distribution(sub)
+
+    with st.expander("Browse raw rows"):
+        render_data_table(sub)
+
+
+if __name__ == "__main__":
+    main()
