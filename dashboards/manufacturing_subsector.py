@@ -6,6 +6,8 @@ Run with:
 
 from __future__ import annotations
 
+import io
+import os
 import re
 from pathlib import Path
 
@@ -16,7 +18,60 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "processed" / "permit_data_extracted.xlsx"
 FRS_FACILITIES_PATH = PROJECT_ROOT / "data" / "external" / "FRS_FACILITIES.csv"
+DASHBOARD_PARQUET_DIR = PROJECT_ROOT / "data" / "processed" / "dashboard"
+PERMITS_PARQUET = DASHBOARD_PARQUET_DIR / "permits.parquet"
+CENTROIDS_PARQUET = DASHBOARD_PARQUET_DIR / "city_centroids.parquet"
+PERMITS_FILENAME = "permits.parquet"
+CENTROIDS_FILENAME = "city_centroids.parquet"
+
+# Optional remote artifact location. When set, the dashboard reads parquet
+# from there instead of the local copy. Two URI schemes are supported:
+#   * https://<bucket>.s3.<region>.amazonaws.com/<prefix>/ — public bucket
+#     accessed over HTTPS, no AWS plumbing required.
+#   * s3://<bucket>/<prefix>/ — read via s3fs. Defaults to anonymous mode
+#     (works on public buckets); set AWS credentials via the standard boto3
+#     chain to read from a private bucket.
+S3_URI_ENV = "PERMIT_DASHBOARD_S3_URI"
+
 SHEET_NAMES = ("Manufacturing NAICS 31-33", "Other NAICS")
+BUILD_HINT = (
+    "Run `python scripts/build_dashboard_parquet.py` to generate the cached "
+    "parquet artifacts for faster loading."
+)
+
+
+def _s3_uri_for(filename: str) -> str | None:
+    """Return the remote URI for a dashboard artifact, or None if not configured.
+
+    Resolves the base URI from (in order) ``st.secrets[S3_URI_ENV]`` for
+    Streamlit Cloud, then ``os.environ[S3_URI_ENV]``.
+    """
+    base: str | None = None
+    try:
+        if S3_URI_ENV in st.secrets:
+            base = str(st.secrets[S3_URI_ENV])
+    except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
+        pass
+    if not base:
+        base = os.environ.get(S3_URI_ENV)
+    if not base:
+        return None
+    return base.rstrip("/") + "/" + filename
+
+
+def _read_remote_parquet(uri: str) -> pd.DataFrame:
+    """Read parquet from an S3 or HTTP(S) URL, treating S3 as a public bucket."""
+    if uri.startswith(("http://", "https://")):
+        import requests
+
+        resp = requests.get(uri, timeout=60)
+        resp.raise_for_status()
+        return pd.read_parquet(io.BytesIO(resp.content))
+    if uri.startswith("s3://"):
+        # anon=True works on public buckets and is ignored on private ones if
+        # AWS credentials happen to be present in the environment.
+        return pd.read_parquet(uri, storage_options={"anon": True})
+    raise ValueError(f"Unsupported remote URI scheme: {uri!r}")
 
 # Special non-NAICS option codes used by the subsector selector.
 ALL_CODE = "ALL"
@@ -127,17 +182,23 @@ def _digits_only(value: object) -> str | None:
 
 
 @st.cache_data(show_spinner="Loading FRS city centroids…")
-def load_city_centroids(path: Path) -> pd.DataFrame:
+def load_city_centroids(csv_path: Path, parquet_path: Path = CENTROIDS_PARQUET) -> pd.DataFrame:
     """Median lat/lon per (state, city) from EPA FRS, used to plot facility points.
 
-    FRS coordinates are at the facility level; collapsing to city centroids gives
-    ~99% coverage of our sites without needing fuzzy name matching. Multiple
-    facilities in one city stack on the same point.
+    Source preference:
+      1. ``PERMIT_DASHBOARD_S3_URI/city_centroids.parquet`` (if env var set)
+      2. local prebuilt parquet (~1 MB)
+      3. raw 336 MB FRS CSV (slow fallback)
     """
-    if not path.exists():
+    remote_uri = _s3_uri_for(CENTROIDS_FILENAME)
+    if remote_uri is not None:
+        return _read_remote_parquet(remote_uri)
+    if parquet_path.exists():
+        return pd.read_parquet(parquet_path)
+    if not csv_path.exists():
         return pd.DataFrame(columns=["key_state", "key_city", "Lat", "Lon"])
     frs = pd.read_csv(
-        path,
+        csv_path,
         dtype=str,
         usecols=["FAC_CITY", "FAC_STATE", "LATITUDE_MEASURE", "LONGITUDE_MEASURE"],
     )
@@ -158,16 +219,36 @@ def load_city_centroids(path: Path) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner="Loading permit dataset…")
-def load_data(path: Path, centroids_path: Path) -> pd.DataFrame:
-    sheets = []
-    for sheet in SHEET_NAMES:
-        try:
-            s = pd.read_excel(path, sheet_name=sheet, dtype=str)
-        except ValueError:
-            continue
-        s["Source Sheet"] = sheet
-        sheets.append(s)
-    df = pd.concat(sheets, ignore_index=True)
+def load_data(
+    xlsx_path: Path,
+    centroids_path: Path,
+    parquet_path: Path = PERMITS_PARQUET,
+) -> pd.DataFrame:
+    remote_uri = _s3_uri_for(PERMITS_FILENAME)
+    if remote_uri is not None:
+        df = _read_remote_parquet(remote_uri)
+        for col in ("NAICS Code", "Classified NAICS"):
+            if col in df.columns:
+                df[col] = df[col].astype("string")
+    elif parquet_path.exists():
+        df = pd.read_parquet(parquet_path)
+        # Excel was loaded as str; ensure parquet path matches by coercing
+        # any non-string columns we treat as text.
+        for col in ("NAICS Code", "Classified NAICS"):
+            if col in df.columns:
+                df[col] = df[col].astype("string")
+    else:
+        sheets = []
+        for sheet in SHEET_NAMES:
+            try:
+                s = pd.read_excel(xlsx_path, sheet_name=sheet, dtype=str)
+            except ValueError:
+                continue
+            s["Source Sheet"] = sheet
+            sheets.append(s)
+        if not sheets:
+            return pd.DataFrame()
+        df = pd.concat(sheets, ignore_index=True)
 
     # Pick the most reliable NAICS: prefer Classified NAICS (full 6-digit),
     # fall back to the raw NAICS Code from the permit. The "Other NAICS" sheet
@@ -560,14 +641,25 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Data")
+        remote_uri = _s3_uri_for(PERMITS_FILENAME)
+        if remote_uri is not None:
+            st.caption(f"Loading from `{remote_uri}`")
+        elif PERMITS_PARQUET.exists():
+            st.caption(f"Loading from `{PERMITS_PARQUET.relative_to(PROJECT_ROOT)}`")
+        else:
+            st.warning(
+                "No prebuilt parquet found — falling back to xlsx (slow). "
+                + BUILD_HINT
+            )
         data_path_str = st.text_input(
-            "Dataset path",
+            "Source xlsx (used if parquet missing)",
             value=str(DEFAULT_DATA_PATH),
             help="Path to permit_data_extracted.xlsx",
         )
         data_path = Path(data_path_str)
-        if not data_path.exists():
-            st.error(f"File not found: {data_path}")
+        have_local_parquet = PERMITS_PARQUET.exists()
+        if not (remote_uri or have_local_parquet or data_path.exists()):
+            st.error(f"Neither remote URI, local parquet, nor xlsx available. {BUILD_HINT}")
             st.stop()
 
     df = load_data(data_path, FRS_FACILITIES_PATH)
