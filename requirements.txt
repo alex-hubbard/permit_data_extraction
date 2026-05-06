@@ -5,11 +5,14 @@ matplotlib
 mkdocs
 notebook
 numpy
+openpyxl
 pandas
 pip
+plotly>=5.0
 python-dotenv
 ruff
 scikit-learn
+streamlit>=1.30
 tqdm
 typer
 -e .
