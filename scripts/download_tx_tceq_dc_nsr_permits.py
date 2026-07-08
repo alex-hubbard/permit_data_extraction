@@ -146,6 +146,13 @@ def main() -> int:
 
     logger.success(f"{len(seen_docs)} unique CFR documents across {len(terms)} terms")
 
+    # Merge with any existing index so targeted runs don't clobber full sweeps.
+    if not args.from_index and index_path.exists():
+        with open(index_path, newline="", encoding="utf-8") as f:
+            for old in csv.DictReader(f):
+                seen_docs.setdefault(old["dDocName"], old)
+        logger.info(f"Merged with existing index -> {len(seen_docs)} documents")
+
     with open(index_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=INDEX_FIELDS, extrasaction="ignore")
         w.writeheader()

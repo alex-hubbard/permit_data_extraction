@@ -87,6 +87,27 @@ def parse_results_page(driver) -> List[Dict[str, str]]:
     return rows
 
 
+def collect_for_airs(driver, airs: str, delay: float) -> List[Dict[str, str]]:
+    """Search by AIRS number (Telerik autocomplete: type, wait, Enter)."""
+    from selenium.webdriver.common.keys import Keys
+
+    driver.get(BASE_URL)
+    time.sleep(delay + 2)
+    box = driver.find_element(By.ID, "ctl00_ContentPlaceHolder2_txtAirsNo_Input")
+    box.clear()
+    box.send_keys(airs)
+    time.sleep(delay + 2)  # let the autocomplete resolve the entry
+    box.send_keys(Keys.ENTER)
+    time.sleep(1)
+    driver.find_element(By.ID, "ctl00_ContentPlaceHolder2_btnSearch").click()
+    time.sleep(delay + 3)
+    rows = parse_results_page(driver)
+    for r in rows:
+        r["search_sic"] = f"airs:{airs}"
+    logger.info(f"AIRS {airs}: {len(rows)} permits")
+    return rows
+
+
 def collect_for_sic(driver, sic: str, delay: float) -> List[Dict[str, str]]:
     driver.get(BASE_URL)
     time.sleep(delay + 2)
@@ -154,6 +175,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--sics", default=",".join(DEFAULT_SICS),
                     help="Comma-separated SIC codes to sweep (default 7374)")
+    ap.add_argument("--airs", default="",
+                    help="Comma-separated AIRS numbers (e.g. 097-00061) to fetch "
+                         "in addition to / instead of SIC sweeps (use --sics '')")
     ap.add_argument("--no-download", action="store_true")
     ap.add_argument("--no-headless", action="store_true")
     ap.add_argument("--delay", type=float, default=1.0)
@@ -168,6 +192,8 @@ def main() -> int:
         all_rows: List[Dict[str, str]] = []
         for sic in [s.strip() for s in args.sics.split(",") if s.strip()]:
             all_rows.extend(collect_for_sic(driver, sic, args.delay))
+        for airs in [a.strip() for a in args.airs.split(",") if a.strip()]:
+            all_rows.extend(collect_for_airs(driver, airs, args.delay))
         # Dedupe on (permit_number, issuance_date) — reissues share numbers.
         seen, rows = set(), []
         for r in all_rows:
@@ -183,6 +209,13 @@ def main() -> int:
         driver.quit()
 
     index_path = OUTPUT_DIR / "ga_epd_dc_permits_index.csv"
+    if index_path.exists():
+        import csv as _csv
+        seen_keys = {(r["permit_number"], r["issuance_date"]) for r in rows}
+        with open(index_path, newline="", encoding="utf-8") as f:
+            for old in _csv.DictReader(f):
+                if (old["permit_number"], old["issuance_date"]) not in seen_keys:
+                    rows.append(old)
     with open(index_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=INDEX_FIELDS, extrasaction="ignore")
         w.writeheader()
