@@ -1,0 +1,19 @@
+[Unit]
+Description=Free-model (gemma-4-thinking) re-extraction of large union permit docs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/afhubbard/permit_data_extraction
+Environment=PATH=/home/afhubbard/anaconda3/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/bash scripts/run_freemodel_reextract.sh
+StandardOutput=append:/home/afhubbard/permit_data_extraction/data/processed/reextraction/freemodel_run.log
+StandardError=inherit
+# Exit 0 = list complete (stay stopped); exit 1 = gave up after an outage
+# (script's 3-no-progress limit) -> restart after a cool-down and resume.
+Restart=on-failure
+RestartSec=600
+
+[Install]
+WantedBy=default.target

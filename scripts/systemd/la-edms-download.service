@@ -1,0 +1,21 @@
+[Unit]
+Description=LDEQ EDMS Title V permit PDF download (server-side OCR)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/afhubbard/permit_data_extraction
+Environment=PATH=/home/afhubbard/anaconda3/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/afhubbard/anaconda3/bin/python3 scripts/download_la_edms_titlev_permits.py download --ocr --subtypes "Final Permit" --description-regex "part\\s*70|title\\s*v\\b|\\b\\d{4}-\\d{5}-V\\d+\\b" --delay 1.0
+StandardOutput=append:/home/afhubbard/permit_data_extraction/data/raw/la_edms_titlev_permits/download.log
+StandardError=inherit
+# Exits 1 while any doc errored (transient outages, dead docs) -> retry with
+# a long cool-down; exits 0 only on a fully clean pass. Resume is via the
+# download log, so restarts only touch not-yet-downloaded docs.
+# Disable this unit once the download is done: systemctl --user disable --now la-edms-download
+Restart=on-failure
+RestartSec=900
+
+[Install]
+WantedBy=default.target
