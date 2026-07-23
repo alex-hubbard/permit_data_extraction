@@ -1,0 +1,20 @@
+[Unit]
+Description=Local OCR (ocrmypdf) of raw LDEQ EDMS permit scans
+
+[Service]
+Type=simple
+WorkingDirectory=/home/afhubbard/permit_data_extraction
+Environment=PATH=/home/afhubbard/anaconda3/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata
+ExecStart=/home/afhubbard/anaconda3/bin/python3 scripts/ocr_la_raw_pdfs.py --jobs 10
+StandardOutput=append:/home/afhubbard/permit_data_extraction/data/raw/la_edms_titlev_permits/la_ocr.log
+StandardError=inherit
+Nice=10
+# One pass per invocation; Restart=always rescans pdfs_raw every 5 min so
+# newly downloaded scans get picked up. Disable once the LA download and
+# OCR backlog are both done: systemctl --user disable --now la-ocr
+Restart=always
+RestartSec=300
+
+[Install]
+WantedBy=default.target

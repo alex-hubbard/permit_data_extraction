@@ -290,7 +290,7 @@ def download_cmd(args: argparse.Namespace) -> int:
         logger.warning("nothing selected to download")
         return 0
 
-    pdf_dir = DEFAULT_OUTPUT_DIR / "pdfs"
+    pdf_dir = DEFAULT_OUTPUT_DIR / args.pdf_dir
     pdf_dir.mkdir(parents=True, exist_ok=True)
 
     already = set()
@@ -373,6 +373,11 @@ def main() -> int:
             p.add_argument("--ocr", action="store_true",
                            help="Request server-side OCR (searchable PDF). "
                                 "LDEQ scans are image-only without this.")
+            p.add_argument("--pdf-dir", default="pdfs",
+                           help="Output subdir under the dataset dir. Use a "
+                                "separate dir (e.g. pdfs_raw) for non-OCR "
+                                "downloads so they aren't mistaken for "
+                                "searchable copies.")
         p.set_defaults(fn=fn)
     args = ap.parse_args()
     return args.fn(args)
