@@ -1,0 +1,19 @@
+[Unit]
+Description=SCAQMD OnBase Title V facility permit PDF download
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/afhubbard/permit_data_extraction
+Environment=PATH=/home/afhubbard/anaconda3/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/afhubbard/anaconda3/bin/python3 scripts/download_aqmd_titlev_permits.py --delay 1.0
+StandardOutput=append:/home/afhubbard/permit_data_extraction/data/raw/aqmd_titlev_permits/download.log
+StandardError=inherit
+# Resumable (skips PDFs on disk). Disable when done:
+#   systemctl --user disable --now aqmd-download
+Restart=on-failure
+RestartSec=900
+
+[Install]
+WantedBy=default.target

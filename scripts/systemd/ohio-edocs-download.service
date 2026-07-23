@@ -1,0 +1,19 @@
+[Unit]
+Description=Ohio EPA eDocs AIR PERMIT document download (headless Chromium)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/afhubbard/permit_data_extraction
+Environment=PATH=/home/afhubbard/anaconda3/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/afhubbard/anaconda3/bin/python3 scripts/download_ohio_epa_air_permits.py
+StandardOutput=append:/home/afhubbard/permit_data_extraction/data/raw/ohio_epa_air_permits/download.log
+StandardError=inherit
+# Resumable via index CSV / files on disk. Disable when done:
+#   systemctl --user disable --now ohio-edocs-download
+Restart=on-failure
+RestartSec=900
+
+[Install]
+WantedBy=default.target

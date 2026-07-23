@@ -22,6 +22,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from permit_data_extraction.config import RAW_DATA_DIR
 from permit_data_extraction.pdf_downloader import SeleniumPDFDownloader, clean_filename
 

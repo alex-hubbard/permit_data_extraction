@@ -1,0 +1,22 @@
+[Unit]
+Description=Minnesota MPCA WIMN latest air permit PDF download (Chromium on WSLg display)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/afhubbard/permit_data_extraction
+Environment=PATH=/home/afhubbard/anaconda3/bin:/usr/local/bin:/usr/bin:/bin
+# Headless Chromium returns 0 facilities (anti-bot); run visible on the WSLg
+# display instead — a browser window will appear on the Windows desktop.
+Environment=DISPLAY=:0
+ExecStart=/home/afhubbard/anaconda3/bin/python3 scripts/download_mn_pca_air_permits.py --restart-browser-every 50
+StandardOutput=append:/home/afhubbard/permit_data_extraction/data/raw/mn_pca_air_latest_permits/download.log
+StandardError=inherit
+# Resumable (skips existing files). Disable when done:
+#   systemctl --user disable --now mn-wimn-download
+Restart=on-failure
+RestartSec=900
+
+[Install]
+WantedBy=default.target
