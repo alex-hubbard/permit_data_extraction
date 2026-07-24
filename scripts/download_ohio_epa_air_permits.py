@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 import time
 from datetime import date, timedelta
@@ -163,33 +164,59 @@ def goto_next_page(driver: webdriver.Chrome, timeout: int) -> bool:
         "//*[@id='ctl00_results_DocHitList_tblDocuments']//a[normalize-space(text())='>']",
         "//*[@id='ctl00_results_DocHitList_tblDocuments']//a[contains(normalize-space(text()), 'Next')]",
     ]
-    for xpath in xpath_candidates:
-        for link in driver.find_elements(By.XPATH, xpath):
-            if not link.is_displayed():
-                continue
-            href = (link.get_attribute("href") or "").lower()
-            classes = (link.get_attribute("class") or "").lower()
-            if "javascript:void" in href or "disabled" in classes:
-                continue
-            try:
-                driver.execute_script("arguments[0].click();", link)
-                _wait_for_table_refresh(driver, timeout)
-                return True
-            except TimeoutException:
-                return False
-            except Exception:
-                continue
+    # The grid re-renders under us, so any element handle can go stale between
+    # find and use; treat staleness as "rescan the candidates", never crash.
+    for attempt in range(3):
+        for xpath in xpath_candidates:
+            for link in driver.find_elements(By.XPATH, xpath):
+                try:
+                    if not link.is_displayed():
+                        continue
+                    href = (link.get_attribute("href") or "").lower()
+                    classes = (link.get_attribute("class") or "").lower()
+                    if "javascript:void" in href or "disabled" in classes:
+                        continue
+                    driver.execute_script("arguments[0].click();", link)
+                    _wait_for_table_refresh(driver, timeout)
+                    return True
+                except TimeoutException:
+                    return False
+                except Exception:
+                    continue
+        time.sleep(1.0)
     return False
 
 
+def migrate_index_csv(index_csv: Path) -> None:
+    """Rewrite a pre-sweep index (7 cols, no bucket) to the current schema."""
+    if not index_csv.exists():
+        return
+    with index_csv.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle))
+    if not rows or rows[0] == INDEX_FIELDS:
+        return
+    logger.info(f"Migrating {index_csv.name} to {len(INDEX_FIELDS)}-column schema.")
+    with index_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(INDEX_FIELDS)
+        for row in rows[1:]:
+            if len(row) == len(INDEX_FIELDS) - 1:
+                row = [""] + row
+            writer.writerow(row[: len(INDEX_FIELDS)])
+
+
 def load_seen_docids(index_csv: Path, output_dir: Path) -> Set[str]:
-    """Resume set: docids from the index CSV plus docid-prefixed filenames on disk."""
+    """Resume set: docids from the index CSV plus docid-prefixed filenames on disk.
+
+    Rows with failed_download status are excluded so failures retry on resume.
+    """
     seen: Set[str] = set()
     if index_csv.exists():
         with index_csv.open(newline="", encoding="utf-8") as handle:
             for row in csv.DictReader(handle):
-                if row.get("docid"):
-                    seen.add(row["docid"])
+                docid = (row.get("docid") or "").strip()
+                if docid.isdigit() and row.get("status") != "failed_download":
+                    seen.add(docid)
     if output_dir.exists():
         for path in output_dir.iterdir():
             m = re.match(r"(\d+)_", path.name)
@@ -394,21 +421,31 @@ def main() -> None:
     index_csv = args.index_csv.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    migrate_index_csv(index_csv)
     seen = load_seen_docids(index_csv, output_dir)
     logger.info(f"Resume set: {len(seen)} docids already downloaded/indexed.")
 
     to_date = args.to_date or date.today()
+    state_path = output_dir / "sweep_state.json"
+    done_buckets: Set[str] = set()
+    if state_path.exists():
+        done_buckets = set(json.loads(state_path.read_text()))
+
     index_writer = IndexWriter(index_csv)
-    crawler = Crawler(
-        output_dir=output_dir,
-        index_writer=index_writer,
-        seen_docids=seen,
-        headless=not args.no_headless,
-        wait_seconds=args.wait_seconds,
-        sleep_seconds=args.sleep_seconds,
-        page_size=args.page_size,
-        stale_pages=args.stale_pages,
-    )
+
+    def make_crawler() -> Crawler:
+        return Crawler(
+            output_dir=output_dir,
+            index_writer=index_writer,
+            seen_docids=seen,
+            headless=not args.no_headless,
+            wait_seconds=args.wait_seconds,
+            sleep_seconds=args.sleep_seconds,
+            page_size=args.page_size,
+            stale_pages=args.stale_pages,
+        )
+
+    crawler = make_crawler()
     try:
         bucket_start = args.from_date
         while bucket_start <= to_date:
@@ -416,7 +453,26 @@ def main() -> None:
                 date(bucket_start.year + args.year_buckets, bucket_start.month, 1) - timedelta(days=1),
                 to_date,
             )
-            sweep(crawler, bucket_start, bucket_end, cap_threshold=args.cap_threshold)
+            key = f"{bucket_start}..{bucket_end}"
+            # Never checkpoint a bucket ending at the sweep edge — new docs keep
+            # arriving there, so it must be re-swept on every run.
+            checkpointable = bucket_end < to_date
+            if key in done_buckets:
+                bucket_start = bucket_end + timedelta(days=1)
+                continue
+            try:
+                sweep(crawler, bucket_start, bucket_end, cap_threshold=args.cap_threshold)
+            except Exception as exc:
+                logger.warning(f"[{key}] bucket failed ({type(exc).__name__}: {exc}); restarting browser.")
+                try:
+                    crawler.close()
+                except Exception:
+                    pass
+                crawler = make_crawler()
+                sweep(crawler, bucket_start, bucket_end, cap_threshold=args.cap_threshold)
+            if checkpointable:
+                done_buckets.add(key)
+                state_path.write_text(json.dumps(sorted(done_buckets)))
             bucket_start = bucket_end + timedelta(days=1)
     finally:
         crawler.close()
