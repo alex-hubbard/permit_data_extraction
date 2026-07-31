@@ -74,8 +74,12 @@ LLM_MAX_WORKERS = 4
 ENABLE_SPEC_SHEET_LOOKUP = False
 
 # LLM model configuration
-LLM_MODEL = "gemini-2.0-flash-lite"  # 1M context, $0.10/1M input tokens
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash-lite")  # 1M context, $0.10/1M input tokens
 LLM_LARGE_MODEL = os.getenv("LLM_LARGE_MODEL", "gemini-2.0-flash-lite")  # 1M context — fallback for docs that exceed primary model context
+# Output-token cap per call. Reasoning models (e.g. gemini-2.5-flash) spend
+# thinking tokens against this budget, so unit-heavy permits can truncate well
+# below the visible-output limit — raise via env for such models.
+LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "32768"))
 
 
 def _env_flag(name: str, default: bool = True) -> bool:
@@ -1757,7 +1761,36 @@ def _is_retryable_error(error):
         or "503" in error_str
         or "server error" in error_str
         or "overloaded" in error_str
+        or "timed out" in error_str
     )
+
+
+def _call_with_hard_timeout(fn, hard_seconds):
+    """Run fn() on a daemon thread and abandon it if it exceeds hard_seconds.
+
+    The OpenAI SDK's per-call ``timeout=`` is not reliably honored on a wedged
+    (half-open) socket — a single request can hang indefinitely (observed: a
+    glm-5 call stuck 75 min against a 300s timeout). This watchdog guarantees a
+    wall-clock bound: on timeout we raise (the message contains "timed out", so
+    the caller's retry logic treats it as retryable) and leave the stuck call on
+    a daemon thread, which will not block process exit.
+    """
+    box = {}
+
+    def _run():
+        try:
+            box["r"] = fn()
+        except Exception as e:  # noqa: BLE001 — surfaced to caller below
+            box["e"] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(hard_seconds)
+    if t.is_alive():
+        raise TimeoutError(f"LLM call hard-timed out after {hard_seconds}s (request abandoned)")
+    if "e" in box:
+        raise box["e"]
+    return box["r"]
 
 
 def _invoke_llm_for_model(client, prompt, filename, model_name):
@@ -1769,19 +1802,24 @@ def _invoke_llm_for_model(client, prompt, filename, model_name):
     time.sleep(0.1)  # Small stagger to avoid thundering herd
     logging.info(f"  Making API call for {filename} using model {model_name}...")
 
+    soft_timeout = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+    hard_timeout = int(os.getenv("LLM_HARD_TIMEOUT_SECONDS", str(soft_timeout + 30)))
     last_error = None
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": "You are an expert at extracting structured information from industrial air permit documents. Always respond with valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1,
-                max_tokens=32768,
-                timeout=60,
-                response_format={"type": "json_object"}
+            response = _call_with_hard_timeout(
+                lambda: client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": "You are an expert at extracting structured information from industrial air permit documents. Always respond with valid JSON."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.1,
+                    max_tokens=LLM_MAX_OUTPUT_TOKENS,
+                    timeout=soft_timeout,
+                    response_format={"type": "json_object"}
+                ),
+                hard_timeout,
             )
             break  # Success — exit retry loop
         except Exception as e:
