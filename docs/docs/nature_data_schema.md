@@ -29,15 +29,18 @@ linking key to the original permit PDF and extracted text.
 | Column | Description |
 | --- | --- |
 | `Facility Name` | Name of the permitted facility. |
+| `Owner/Operator Name` | Legal entity that owns or operates the facility, if different from Facility Name. |
 | `Facility Address` | Street address of the facility. |
 | `Facility City` | City where the facility is located. |
 | `Facility State Abbreviation` | Two-letter state abbreviation. |
 | `Facility Zip Code` | ZIP or postal code. |
 | `Facility County` | County name. |
 | `NAICS Code` | NAICS industry classification code. |
+| `SIC Code` | Standard Industrial Classification code (digits only, e.g., 3295). |
 | `Operating Hours` | Reported operating hours or schedule. |
 | `Industry Description` | Narrative industry or process description. |
 | `Permit Number` | Permit identifier assigned by the agency. |
+| `Permit Type` | Permit classification (e.g., Title V, State Only Operating Permit, Synthetic Minor). |
 | `Issuance Date` | Permit issuance date. |
 | `Expiration Date` | Permit expiration date. |
 | `Regulatory Authority` | Issuing authority (state agency or EPA). |
@@ -56,6 +59,8 @@ linking key to the original permit PDF and extracted text.
 | `Unit Type` | Equipment type (boiler, kiln, furnace, etc.). |
 | `Pollutants` | Pollutants associated with the unit. |
 | `Emission Limits` | Emission limits as listed in the permit (text). |
+| `Opacity Limit` | Visible emission limit (e.g., 20%, or 10% 3 min/hr; 30% any time). |
+| `Throughput/Production Limit` | Material processing or production rate limits (e.g., 500 tons/day). |
 | `Control Device(s)` | Control devices associated with the unit. |
 | `Capacity Value` | Numeric capacity value. |
 | `Capacity Unit` | Capacity unit (e.g., MMBtu/hr, tons/year). |
@@ -63,6 +68,7 @@ linking key to the original permit PDF and extracted text.
 | `Rated Efficiency` | Efficiency rating (e.g., 90%). |
 | `Annual Run Hours` | Annual operating hours. |
 | `Generation Capacity` | Electrical generation capacity (if applicable). |
+| `Applicable NESHAP/NSPS Subpart` | Specific federal standard(s) applicable to this unit (e.g., 40 CFR 63 Subpart DDDDD). |
 
 ## Missingness And Error Conventions
 
