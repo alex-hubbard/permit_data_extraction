@@ -257,10 +257,14 @@ def load_city_centroids(csv_path: Path, parquet_path: Path = CENTROIDS_PARQUET) 
     return centroids
 
 
+# Lat/Lon are intentionally excluded: they come from the centroid merge, which
+# still runs at load time so that one published parquet works with both this
+# code and older deployments (a file carrying Lat/Lon would make the old merge
+# emit Lat_x/Lat_y and drop plain "Lat").
 _DERIVED_COLUMNS = frozenset(
     ["NAICS_clean", "Subsector", "Site Key", "Capacity Value (num)",
      "Capacity Unit (norm)", "Fuel Type (norm)", "Unit Quantity (num)",
-     "key_state", "key_city", "Lat", "Lon"]
+     "key_state", "key_city"]
     + [f"is_{code}" for code in KEYWORD_FILTERS]
 )
 
@@ -301,7 +305,8 @@ def load_data(
     # carries every derived column and the centroid join. Recomputing them here
     # exhausts Streamlit's memory budget at current row counts, so short-circuit.
     if _DERIVED_COLUMNS.issubset(df.columns):
-        return df
+        centroids = load_city_centroids(centroids_path)
+        return df.merge(centroids, on=["key_state", "key_city"], how="left")
 
     # Pick the most reliable NAICS: prefer Classified NAICS (full 6-digit),
     # fall back to the raw NAICS Code from the permit. The "Other NAICS" sheet

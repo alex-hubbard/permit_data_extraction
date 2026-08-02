@@ -74,17 +74,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--in", dest="src", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--centroids", type=Path,
-                    default=Path("data/processed/dashboard/city_centroids.parquet"),
-                    help="merge Lat/Lon in at build time so the app skips the join")
     args = ap.parse_args()
 
+    # Lat/Lon are deliberately NOT baked in. The app merges centroids at load
+    # time, and a file that already carries Lat/Lon makes that merge produce
+    # Lat_x/Lat_y, leaving no plain "Lat" -- which crashes any app version
+    # still running the old load path. Keeping the merge at runtime lets one
+    # published file serve both old and new app code. The merge is cheap next
+    # to the .apply() passes this build removes.
     centroids = None
-    if args.centroids.exists():
-        centroids = pd.read_parquet(args.centroids)
-        print(f"centroids: {len(centroids):,} city keys")
-    else:
-        print(f"NOTE: {args.centroids} not found; Lat/Lon left unmerged")
 
     src = pq.ParquetFile(args.src)
     present = [c for c in KEEP if c in src.schema_arrow.names]
