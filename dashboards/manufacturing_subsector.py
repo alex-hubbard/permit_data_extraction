@@ -50,7 +50,9 @@ def _s3_uri_for(filename: str) -> str | None:
     try:
         if S3_URI_ENV in st.secrets:
             base = str(st.secrets[S3_URI_ENV])
-    except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
+    except Exception:
+        # No secrets.toml, or a Streamlit version whose secrets error class
+        # differs; either way fall through to the environment variable.
         pass
     if not base:
         base = os.environ.get(S3_URI_ENV)
@@ -59,18 +61,55 @@ def _s3_uri_for(filename: str) -> str | None:
     return base.rstrip("/") + "/" + filename
 
 
+# Low-cardinality columns are read straight into pandas categoricals from the
+# parquet dictionary. Decoding them into Python strings instead costs ~4x the
+# memory (1.71 GB vs 0.39 GB at 1.1M rows) and is what exhausts Streamlit's
+# budget. Columns absent from a file are ignored by pyarrow.
+_DICTIONARY_COLUMNS = [
+    "Facility Name", "Facility City", "Facility State Abbreviation", "NAICS Code",
+    "Classified NAICS", "Industry Description", "Unit Type", "Capacity Unit",
+    "Fuel Type", "Control Device(s)", "Permit Number", "Source Sheet",
+    "NAICS_clean", "Subsector", "Site Key", "Capacity Unit (norm)",
+    "Fuel Type (norm)", "key_state", "key_city",
+]
+
+
+def _parquet_to_df(source) -> pd.DataFrame:
+    """Read parquet, using categoricals only for dashboard-ready files.
+
+    Categorical columns are what keeps the frame small, but the legacy
+    derivation path below calls .fillna("") on text columns, which raises on a
+    Categorical. Legacy files are small enough not to need the optimization, so
+    only files that already carry the derived columns are read this way.
+    """
+    import pyarrow.parquet as pq
+
+    seekable = hasattr(source, "seek")
+    names = set(pq.ParquetFile(source).schema_arrow.names)
+    if seekable:
+        source.seek(0)
+    ready = _DERIVED_COLUMNS.issubset(names)
+    cols = [c for c in _DICTIONARY_COLUMNS if c in names] if ready else []
+    return pq.read_table(source, read_dictionary=cols).to_pandas()
+
+
 def _read_remote_parquet(uri: str) -> pd.DataFrame:
     """Read parquet from an S3 or HTTP(S) URL, treating S3 as a public bucket."""
     if uri.startswith(("http://", "https://")):
         import requests
 
-        resp = requests.get(uri, timeout=60)
+        resp = requests.get(uri, timeout=120)
         resp.raise_for_status()
-        return pd.read_parquet(io.BytesIO(resp.content))
+        return _parquet_to_df(io.BytesIO(resp.content))
     if uri.startswith("s3://"):
         # anon=True works on public buckets and is ignored on private ones if
         # AWS credentials happen to be present in the environment.
-        return pd.read_parquet(uri, storage_options={"anon": True})
+        import pyarrow.fs as pafs
+
+        path = uri[len("s3://"):]
+        fs = pafs.S3FileSystem(anonymous=True)
+        with fs.open_input_file(path) as f:
+            return _parquet_to_df(f)
     raise ValueError(f"Unsupported remote URI scheme: {uri!r}")
 
 # Special non-NAICS option codes used by the subsector selector.
@@ -218,6 +257,14 @@ def load_city_centroids(csv_path: Path, parquet_path: Path = CENTROIDS_PARQUET) 
     return centroids
 
 
+_DERIVED_COLUMNS = frozenset(
+    ["NAICS_clean", "Subsector", "Site Key", "Capacity Value (num)",
+     "Capacity Unit (norm)", "Fuel Type (norm)", "Unit Quantity (num)",
+     "key_state", "key_city", "Lat", "Lon"]
+    + [f"is_{code}" for code in KEYWORD_FILTERS]
+)
+
+
 @st.cache_data(show_spinner="Loading permit dataset…")
 def load_data(
     xlsx_path: Path,
@@ -231,7 +278,7 @@ def load_data(
             if col in df.columns:
                 df[col] = df[col].astype("string")
     elif parquet_path.exists():
-        df = pd.read_parquet(parquet_path)
+        df = _parquet_to_df(parquet_path)
         # Excel was loaded as str; ensure parquet path matches by coercing
         # any non-string columns we treat as text.
         for col in ("NAICS Code", "Classified NAICS"):
@@ -249,6 +296,12 @@ def load_data(
         if not sheets:
             return pd.DataFrame()
         df = pd.concat(sheets, ignore_index=True)
+
+    # A dashboard-ready parquet (scripts/build_dashboard_ready_parquet.py) already
+    # carries every derived column and the centroid join. Recomputing them here
+    # exhausts Streamlit's memory budget at current row counts, so short-circuit.
+    if _DERIVED_COLUMNS.issubset(df.columns):
+        return df
 
     # Pick the most reliable NAICS: prefer Classified NAICS (full 6-digit),
     # fall back to the raw NAICS Code from the permit. The "Other NAICS" sheet
