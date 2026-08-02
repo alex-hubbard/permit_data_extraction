@@ -277,6 +277,7 @@ def tier(cov):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--union", help="union CSV to benchmark (default: the module's UNION_CSV)")
     ap.add_argument("--refresh-echo", action="store_true")
     ap.add_argument("--threshold", type=float, default=93,
                     help="rapidfuzz token_set_ratio cutoff for fuzzy matches")
@@ -285,6 +286,10 @@ def main():
                     help="ASM vintage (2021 is the latest non-Economic-Census year)")
     args = ap.parse_args()
     ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
+    global UNION_CSV
+    if args.union:
+        UNION_CSV = Path(args.union)
+    print(f"union: {UNION_CSV}")
 
     u = pd.read_csv(UNION_CSV, dtype=str, keep_default_na=False,
                     usecols=["Filename", "Facility State Abbreviation",

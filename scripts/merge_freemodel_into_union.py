@@ -35,6 +35,9 @@ from pathlib import Path
 
 import pandas as pd
 
+# Defaults preserve the original gemma v2->v3 merge; all overridable via CLI
+# so the same merge-not-replace logic layers any results run onto any union
+# (e.g. the GCP Flash batch: v3 -> v4 with --source-run gcp_flash_2026-07).
 UNION_CSV = Path("data/processed/permit_data_union_v2.csv")
 FM_ROWS_CSV = Path("data/processed/reextraction/freemodel_results_rows.csv")
 FM_JSONL = Path("data/processed/reextraction/freemodel_results.jsonl")
@@ -90,10 +93,23 @@ def doc_chars_map():
 
 
 def main():
+    global UNION_CSV, FM_ROWS_CSV, FM_JSONL, OUT_CSV, REPORT_CSV
+    global SOURCE_RUN_TAG, PROCESSING_DATE
     ap = argparse.ArgumentParser()
     ap.add_argument("--write", action="store_true",
-                    help="write permit_data_union_v3.csv (default: dry-run report only)")
+                    help="write the output union (default: dry-run report only)")
+    ap.add_argument("--union-in", type=Path, default=UNION_CSV)
+    ap.add_argument("--union-out", type=Path, default=OUT_CSV)
+    ap.add_argument("--rows-csv", type=Path, default=FM_ROWS_CSV)
+    ap.add_argument("--results-jsonl", type=Path, default=FM_JSONL)
+    ap.add_argument("--report-csv", type=Path, default=REPORT_CSV)
+    ap.add_argument("--source-run", default=SOURCE_RUN_TAG)
+    ap.add_argument("--processing-date", default=PROCESSING_DATE)
     args = ap.parse_args()
+    UNION_CSV, OUT_CSV = args.union_in, args.union_out
+    FM_ROWS_CSV, FM_JSONL = args.rows_csv, args.results_jsonl
+    REPORT_CSV = args.report_csv
+    SOURCE_RUN_TAG, PROCESSING_DATE = args.source_run, args.processing_date
 
     union = pd.read_csv(UNION_CSV, dtype=str, keep_default_na=False)
     fm = pd.read_csv(FM_ROWS_CSV, dtype=str, keep_default_na=False)

@@ -39,15 +39,19 @@ def unsanitize(obj):
 
 
 def iter_prediction_lines(src: str):
+    # Stream line-by-line: prediction files can be multiple GB, and
+    # read_text() on those OOM-kills small machines silently.
     if src.startswith("gs://"):
         with tempfile.TemporaryDirectory() as td:
             subprocess.run(["gsutil", "-m", "-q", "cp", "-r", src.rstrip("/") + "/*", td],
                            check=True)
             for f in sorted(Path(td).rglob("*.jsonl")):
-                yield from f.read_text(encoding="utf-8").splitlines()
+                with f.open(encoding="utf-8") as fh:
+                    yield from fh
     else:
         for f in sorted(Path(src).rglob("*.jsonl")):
-            yield from f.read_text(encoding="utf-8").splitlines()
+            with f.open(encoding="utf-8") as fh:
+                yield from fh
 
 
 def main():
