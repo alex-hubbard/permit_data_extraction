@@ -39,16 +39,45 @@ KEEP = [
     "Unit Description", "Unit Type", "Unit Quantity",
     "Capacity Value", "Capacity Unit", "Fuel Type", "Control Device(s)",
     "Permit Number", "Source Sheet",
+    "Filename",  # join key for the resolved-NAICS table
 ]
 BATCH = 100_000
 
+# filename -> (resolved NAICS, source), from backfill_naics.py + classify_naics_llm.py
+NAICS_FINAL = Path("data/processed/analysis/naics_final.csv")
 
-def derive(df: pd.DataFrame) -> pd.DataFrame:
+
+def load_naics_final():
+    if not NAICS_FINAL.exists():
+        print(f"NOTE: {NAICS_FINAL} not found; falling back to in-row NAICS columns")
+        return {}
+    import csv
+    out = {}
+    with NAICS_FINAL.open(encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            if r["naics_final"]:
+                out[r["filename"]] = (r["naics_final"], r["naics_source"])
+    print(f"resolved NAICS table: {len(out):,} permits")
+    return out
+
+
+def derive(df: pd.DataFrame, naics_final=None) -> pd.DataFrame:
+    # Prefer the resolved code (permit > ECHO > derived > SIC > LLM, with the
+    # 339999 catch-all excluded). The old precedence took the pipeline's
+    # Classified NAICS over the permit's own code, which agreed with it only
+    # 43% of the time. Fall back to the in-row columns where unresolved.
     classified = (df["Classified NAICS"].apply(dash._digits_only)
                   if "Classified NAICS" in df.columns
                   else pd.Series([None] * len(df), index=df.index))
     raw = df["NAICS Code"].apply(dash._digits_only)
-    naics = classified.where(classified.notna(), raw)
+    naics = raw.where(raw.notna(), classified)
+    if naics_final and "Filename" in df.columns:
+        resolved = df["Filename"].map(lambda f: (naics_final.get(f) or (None, None))[0])
+        df["NAICS Source"] = df["Filename"].map(
+            lambda f: (naics_final.get(f) or (None, ""))[1])
+        naics = resolved.where(resolved.notna(), naics)
+    else:
+        df["NAICS Source"] = ""
     df["NAICS_clean"] = naics
     df["Subsector"] = naics.str[:3]
 
@@ -84,6 +113,7 @@ def main():
     # to the .apply() passes this build removes.
     centroids = None
 
+    naics_final = load_naics_final()
     src = pq.ParquetFile(args.src)
     present = [c for c in KEEP if c in src.schema_arrow.names]
     missing = [c for c in KEEP if c not in src.schema_arrow.names]
@@ -94,7 +124,7 @@ def main():
     n = 0
     try:
         for batch in src.iter_batches(batch_size=BATCH, columns=present):
-            df = derive(batch.to_pandas())
+            df = derive(batch.to_pandas(), naics_final)
             if centroids is not None:
                 df = df.merge(centroids, on=["key_state", "key_city"], how="left")
             table = pa.Table.from_pandas(df, preserve_index=False)
