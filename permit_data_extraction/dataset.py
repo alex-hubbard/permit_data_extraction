@@ -1807,18 +1807,25 @@ def _invoke_llm_for_model(client, prompt, filename, model_name):
     last_error = None
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         try:
+            # Some hosted models reject parameters others require (e.g. newer
+            # Claude builds 400 on `temperature` with "deprecated for this
+            # model"). Keep the defaults, but allow a run to drop a parameter
+            # via LLM_OMIT_PARAMS="temperature,response_format".
+            call_kwargs = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": "You are an expert at extracting structured information from industrial air permit documents. Always respond with valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.1,
+                "max_tokens": LLM_MAX_OUTPUT_TOKENS,
+                "timeout": soft_timeout,
+                "response_format": {"type": "json_object"},
+            }
+            for _p in os.getenv("LLM_OMIT_PARAMS", "").split(","):
+                call_kwargs.pop(_p.strip(), None)
             response = _call_with_hard_timeout(
-                lambda: client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": "You are an expert at extracting structured information from industrial air permit documents. Always respond with valid JSON."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.1,
-                    max_tokens=LLM_MAX_OUTPUT_TOKENS,
-                    timeout=soft_timeout,
-                    response_format={"type": "json_object"}
-                ),
+                lambda: client.chat.completions.create(**call_kwargs),
                 hard_timeout,
             )
             break  # Success — exit retry loop
