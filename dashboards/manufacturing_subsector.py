@@ -61,35 +61,30 @@ def _s3_uri_for(filename: str) -> str | None:
     return base.rstrip("/") + "/" + filename
 
 
-# Low-cardinality columns are read straight into pandas categoricals from the
-# parquet dictionary. Decoding them into Python strings instead costs ~4x the
-# memory (1.71 GB vs 0.39 GB at 1.1M rows) and is what exhausts Streamlit's
-# budget. Columns absent from a file are ignored by pyarrow.
-_DICTIONARY_COLUMNS = [
-    "Facility Name", "Facility City", "Facility State Abbreviation", "NAICS Code",
-    "Classified NAICS", "Industry Description", "Unit Type", "Capacity Unit",
-    "Fuel Type", "Control Device(s)", "Permit Number", "Source Sheet",
-    "NAICS_clean", "Subsector", "Site Key", "Capacity Unit (norm)",
-    "Fuel Type (norm)", "key_state", "key_city",
-]
-
-
 def _parquet_to_df(source) -> pd.DataFrame:
     """Read parquet, using categoricals only for dashboard-ready files.
 
-    Categorical columns are what keeps the frame small, but the legacy
-    derivation path below calls .fillna("") on text columns, which raises on a
-    Categorical. Legacy files are small enough not to need the optimization, so
-    only files that already carry the derived columns are read this way.
+    String columns are read straight into pandas categoricals from the parquet
+    dictionary. Decoding them into Python strings instead costs ~4-8x the
+    memory (3.6 GB vs 0.6 GB at 1.1M rows x 64 columns) and is what exhausts
+    Streamlit's budget. Categoricals are what keeps the frame small, but the
+    legacy derivation path below calls .fillna("") on text columns, which
+    raises on a Categorical. Legacy files are small enough not to need the
+    optimization, so only files that already carry the derived columns are
+    read this way.
     """
+    import pyarrow as pa
     import pyarrow.parquet as pq
 
-    seekable = hasattr(source, "seek")
-    names = set(pq.ParquetFile(source).schema_arrow.names)
-    if seekable:
+    schema = pq.ParquetFile(source).schema_arrow
+    if hasattr(source, "seek"):
         source.seek(0)
-    ready = _DERIVED_COLUMNS.issubset(names)
-    cols = [c for c in _DICTIONARY_COLUMNS if c in names] if ready else []
+    ready = _DERIVED_COLUMNS.issubset(schema.names)
+    cols = (
+        [f.name for f in schema
+         if pa.types.is_string(f.type) or pa.types.is_large_string(f.type)]
+        if ready else []
+    )
     return pq.read_table(source, read_dictionary=cols).to_pandas()
 
 
@@ -114,6 +109,7 @@ def _read_remote_parquet(uri: str) -> pd.DataFrame:
 
 # Special non-NAICS option codes used by the subsector selector.
 ALL_CODE = "ALL"
+MFG_CODE = "MFG"
 DATA_CENTER_CODE = "DATA_CENTER"
 WATER_CODE = "WATER"
 WASTEWATER_CODE = "WASTEWATER"
@@ -162,6 +158,73 @@ NAICS_SUBSECTOR_LABELS = {
     "337": "Furniture and Related Product",
     "339": "Miscellaneous",
 }
+
+# Labels for the non-manufacturing 3-digit subsectors that appear now that the
+# dashboard covers the full corpus. Codes without an entry fall back to
+# "NAICS <code>".
+OTHER_SUBSECTOR_LABELS = {
+    "111": "Crop Production",
+    "112": "Animal Production",
+    "113": "Forestry and Logging",
+    "115": "Support Activities for Agriculture",
+    "211": "Oil and Gas Extraction",
+    "212": "Mining (except Oil and Gas)",
+    "213": "Support Activities for Mining",
+    "221": "Utilities",
+    "236": "Construction of Buildings",
+    "237": "Heavy and Civil Engineering Construction",
+    "238": "Specialty Trade Contractors",
+    "423": "Merchant Wholesalers, Durable Goods",
+    "424": "Merchant Wholesalers, Nondurable Goods",
+    "441": "Motor Vehicle and Parts Dealers",
+    "447": "Gasoline Stations",
+    "481": "Air Transportation",
+    "482": "Rail Transportation",
+    "483": "Water Transportation",
+    "484": "Truck Transportation",
+    "486": "Pipeline Transportation",
+    "488": "Support Activities for Transportation",
+    "493": "Warehousing and Storage",
+    "511": "Publishing Industries",
+    "517": "Telecommunications",
+    "518": "Data Processing, Hosting, and Related Services",
+    "541": "Professional, Scientific, and Technical Services",
+    "562": "Waste Management and Remediation Services",
+    "611": "Educational Services",
+    "622": "Hospitals",
+    "721": "Accommodation",
+    "811": "Repair and Maintenance",
+    "921": "Executive, Legislative, and General Government",
+    "922": "Justice, Public Order, and Safety Activities",
+    "928": "National Security and International Affairs",
+}
+
+# Some permits state only a 2-digit sector; NAICS_clean[:3] then yields a
+# 2-character "subsector". Label those honestly rather than hiding them.
+SECTOR2_LABELS = {
+    "11": "Agriculture (2-digit code only)",
+    "21": "Mining, Oil and Gas (2-digit code only)",
+    "22": "Utilities (2-digit code only)",
+    "23": "Construction (2-digit code only)",
+    "31": "Manufacturing (2-digit code only)",
+    "32": "Manufacturing (2-digit code only)",
+    "33": "Manufacturing (2-digit code only)",
+    "42": "Wholesale Trade (2-digit code only)",
+    "48": "Transportation (2-digit code only)",
+    "49": "Transportation and Warehousing (2-digit code only)",
+    "56": "Admin and Waste Services (2-digit code only)",
+    "92": "Public Administration (2-digit code only)",
+}
+
+
+def subsector_label(code: str) -> str:
+    if code in NAICS_SUBSECTOR_LABELS:
+        return NAICS_SUBSECTOR_LABELS[code]
+    if code in OTHER_SUBSECTOR_LABELS:
+        return OTHER_SUBSECTOR_LABELS[code]
+    if code in SECTOR2_LABELS:
+        return SECTOR2_LABELS[code]
+    return f"NAICS {code}"
 
 # Canonical capacity-unit normalization. Keys are lowercased/stripped strings.
 CAPACITY_UNIT_NORMALIZATION = {
@@ -360,18 +423,17 @@ def load_data(
     return df
 
 
-def _all_mask(df: pd.DataFrame) -> pd.Series:
-    """Rows in the 'All facilities' scope: manufacturing 31-33 ∪ data center ∪ water ∪ wastewater."""
-    mask = df["Subsector"].isin(NAICS_SUBSECTOR_LABELS)
-    for code in KEYWORD_FILTERS:
-        mask = mask | df[f"is_{code}"]
-    return mask
+def _mfg_mask(df: pd.DataFrame) -> pd.Series:
+    """Rows in the manufacturing scope (3-digit NAICS 311-339)."""
+    return df["Subsector"].isin(NAICS_SUBSECTOR_LABELS)
 
 
 def filter_by_option(df: pd.DataFrame, code: str) -> pd.DataFrame:
     """Apply the dropdown selection to the dataframe."""
     if code == ALL_CODE:
-        return df[_all_mask(df)]
+        return df
+    if code == MFG_CODE:
+        return df[_mfg_mask(df)]
     if code in KEYWORD_FILTERS:
         return df[df[f"is_{code}"]]
     return df[df["Subsector"] == code]
@@ -379,21 +441,31 @@ def filter_by_option(df: pd.DataFrame, code: str) -> pd.DataFrame:
 
 def option_row_count(df: pd.DataFrame, code: str) -> int:
     if code == ALL_CODE:
-        return int(_all_mask(df).sum())
+        return len(df)
+    if code == MFG_CODE:
+        return int(_mfg_mask(df).sum())
     if code in KEYWORD_FILTERS:
         return int(df[f"is_{code}"].sum())
     return int((df["Subsector"] == code).sum())
 
 
+# Subsectors with fewer rows than this are left out of the dropdown (they are
+# still counted in the entire-dataset view and in the pie's "Other" slice).
+MIN_SUBSECTOR_ROWS = 100
+
+
 def subsector_options(df: pd.DataFrame) -> list[tuple[str, str]]:
     """Return (code, label) pairs for the dropdown.
 
-    Order: All facilities → keyword virtual subsectors → NAICS 31-33 subsectors.
-    Each label includes the row count for the option.
+    Order: entire dataset → manufacturing aggregate → keyword virtual
+    subsectors → every 3-digit subsector present (largest first). Each label
+    includes the row count for the option.
     """
     items: list[tuple[str, str]] = []
 
-    items.append((ALL_CODE, f"All facilities  ({option_row_count(df, ALL_CODE):,} units)"))
+    items.append((ALL_CODE, f"Entire dataset  ({len(df):,} units)"))
+    items.append((MFG_CODE,
+                  f"Manufacturing (NAICS 31–33)  ({option_row_count(df, MFG_CODE):,} units)"))
 
     virtual = [
         (DATA_CENTER_CODE, "Data centers"),
@@ -404,24 +476,27 @@ def subsector_options(df: pd.DataFrame) -> list[tuple[str, str]]:
         items.append((code, f"{label}  ({option_row_count(df, code):,} units)"))
 
     counts = df["Subsector"].value_counts()
-    for code in sorted(c for c in counts.index if c in NAICS_SUBSECTOR_LABELS):
-        label = NAICS_SUBSECTOR_LABELS[code]
-        items.append((code, f"{code} — {label}  ({counts[code]:,} units)"))
+    for code, count in counts.items():
+        if not isinstance(code, str) or not code:
+            continue
+        if count < MIN_SUBSECTOR_ROWS:
+            break  # value_counts is sorted descending
+        items.append((code, f"{code} — {subsector_label(code)}  ({count:,} units)"))
     return items
 
 
 def option_display_name(code: str) -> str:
     if code == ALL_CODE:
-        return "All facilities"
+        return "Entire dataset"
+    if code == MFG_CODE:
+        return "Manufacturing (NAICS 31–33)"
     if code == DATA_CENTER_CODE:
         return "Data centers"
     if code == WATER_CODE:
         return "Water treatment / supply"
     if code == WASTEWATER_CODE:
         return "Wastewater / sewage"
-    if code in NAICS_SUBSECTOR_LABELS:
-        return f"{code} — {NAICS_SUBSECTOR_LABELS[code]}"
-    return code
+    return f"{code} — {subsector_label(code)}"
 
 
 def kpi_row(sub: pd.DataFrame) -> None:
@@ -431,13 +506,15 @@ def kpi_row(sub: pd.DataFrame) -> None:
     units_per_site = sub.groupby("Site Key").size()
     median_units = float(units_per_site.median()) if len(units_per_site) else 0.0
     permits = sub["Permit Number"].nunique() if "Permit Number" in sub.columns else 0
+    documents = sub["Filename"].nunique() if "Filename" in sub.columns else 0
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Facilities (sites)", f"{facilities:,}")
     c2.metric("Permits", f"{permits:,}")
-    c3.metric("Emission units", f"{units:,}")
-    c4.metric("States represented", f"{states}")
-    c5.metric("Median units / site", f"{median_units:.0f}")
+    c3.metric("Permit documents", f"{documents:,}")
+    c4.metric("Emission units", f"{units:,}")
+    c5.metric("States represented", f"{states}")
+    c6.metric("Median units / site", f"{median_units:.0f}")
 
 
 def _primary_bucket(sub: pd.DataFrame) -> pd.Series:
@@ -448,7 +525,7 @@ def _primary_bucket(sub: pd.DataFrame) -> pd.Series:
     label = pd.Series(index=sub.index, dtype="object")
     # NAICS bucket first (lowest priority).
     naics_label = sub["Subsector"].map(
-        lambda c: f"{c} — {NAICS_SUBSECTOR_LABELS[c]}" if c in NAICS_SUBSECTOR_LABELS else None
+        lambda c: f"{c} — {subsector_label(c)}" if isinstance(c, str) and c else None
     )
     label = label.where(label.notna(), naics_label)
     # Keyword tags overwrite (highest priority: data center, then water, then wastewater).
@@ -463,14 +540,13 @@ def _primary_bucket(sub: pd.DataFrame) -> pd.Series:
 
 
 def chart_subsector_pie(sub: pd.DataFrame) -> None:
-    """Pie of subsector composition for the All-facilities scope."""
-    bucket = _primary_bucket(sub)
-    counts = (
-        bucket.dropna()
-        .value_counts()
-        .rename_axis("Subsector")
-        .reset_index(name="units")
-    )
+    """Pie of subsector composition for the aggregate scopes."""
+    bucket = _primary_bucket(sub).fillna("Unclassified")
+    vc = bucket.value_counts()
+    if len(vc) > 14:
+        vc = pd.concat([vc.head(13),
+                        pd.Series({"Other subsectors": int(vc.iloc[13:].sum())})])
+    counts = vc.rename_axis("Subsector").reset_index(name="units")
     if counts.empty:
         st.info("No rows to summarize.")
         return
@@ -669,24 +745,92 @@ def chart_capacity_distribution(sub: pd.DataFrame) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
+# Internal plumbing columns kept out of the table and the export files.
+_EXPORT_EXCLUDE = frozenset(
+    ["Lat", "Lon", "key_state", "key_city", "Site Key"]
+    + [f"is_{code}" for code in KEYWORD_FILTERS]
+)
+
+# Reader-friendly ordering for the front of the table; every remaining source
+# column follows in file order so the full schema is always visible.
+_LEAD_COLUMNS = [
+    "Facility Name", "Facility City", "Facility State Abbreviation",
+    "NAICS_clean", "NAICS Source", "Industry Description",
+    "Unit ID", "Unit Description", "Unit Type", "Unit Make", "Unit Model",
+    "Year of Manufacture", "Capacity Value", "Capacity Unit", "Fuel Type",
+    "Pollutants", "Emission Limits", "Control Device(s)",
+    "Permit Number", "Issuance Date", "Expiration Date",
+    "Regulatory Authority", "Filename",
+]
+
+
+def export_columns(sub: pd.DataFrame) -> list[str]:
+    lead = [c for c in _LEAD_COLUMNS if c in sub.columns]
+    rest = [c for c in sub.columns if c not in lead and c not in _EXPORT_EXCLUDE]
+    return lead + rest
+
+
 def render_data_table(sub: pd.DataFrame) -> None:
-    cols = [
-        "Facility Name",
-        "Facility City",
-        "Facility State Abbreviation",
-        "NAICS_clean",
-        "Industry Description",
-        "Unit Description",
-        "Unit Type",
-        "Capacity Value (num)",
-        "Capacity Unit (norm)",
-        "Fuel Type (norm)",
-        "Control Device(s)",
-        "Permit Number",
-    ]
-    cols = [c for c in cols if c in sub.columns]
-    st.dataframe(sub[cols].head(500), use_container_width=True, height=320)
-    st.caption(f"Showing first 500 of {len(sub):,} rows in subsector.")
+    cols = export_columns(sub)
+    st.dataframe(sub[cols].head(500), use_container_width=True, height=380)
+    st.caption(
+        f"Showing first 500 of {len(sub):,} rows — all {len(cols)} data columns. "
+        "Use the download buttons below for the complete selection."
+    )
+
+
+# CSV blows up to ~3 KB/row with every column included; cap it so a download
+# click can't exhaust the server's memory. Parquet has no cap.
+CSV_MAX_ROWS = 250_000
+
+
+def render_downloads(sub: pd.DataFrame, code: str, state_filter: list[str]) -> None:
+    st.markdown("### Download this selection")
+    cols = export_columns(sub)
+    n = len(sub)
+    slug = "permit_units_" + (code.lower() if code else "all")
+    if state_filter:
+        slug += "_" + "-".join(s.lower() for s in sorted(state_filter)[:5])
+
+    prepare = st.checkbox(
+        f"Prepare download files ({n:,} rows × {len(cols)} columns)",
+        help="Files are generated on demand so browsing stays fast.",
+    )
+    if not prepare:
+        return
+    export = sub[cols].copy()
+    # Filtered frames inherit the full dataset's category dictionaries, which
+    # bloats the written file; drop the unused entries first.
+    for c in export.select_dtypes(include="category").columns:
+        export[c] = export[c].cat.remove_unused_categories()
+
+    buf = io.BytesIO()
+    export.to_parquet(buf, index=False)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "Download Parquet (recommended)",
+            data=buf.getvalue(),
+            file_name=f"{slug}.parquet",
+            mime="application/octet-stream",
+            use_container_width=True,
+        )
+    with c2:
+        if n <= CSV_MAX_ROWS:
+            csv_bytes = export.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "Download CSV",
+                data=csv_bytes,
+                file_name=f"{slug}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        else:
+            st.caption(
+                f"CSV export is capped at {CSV_MAX_ROWS:,} rows; narrow the "
+                "selection with a subsector or state filter, or use the "
+                "Parquet file (readable in pandas, R, Excel via Power Query)."
+            )
 
 
 def main() -> None:
@@ -742,18 +886,23 @@ def main() -> None:
         sub = sub[sub["Facility State Abbreviation"].isin(state_filter)]
 
     st.subheader(option_display_name(chosen_code))
+    if chosen_code == ALL_CODE:
+        st.caption(
+            "Every unit-level record extracted from state and district air "
+            "permits. Select a subsector in the sidebar to drill down."
+        )
     if sub.empty:
         st.warning("No rows match the current filters.")
         return
 
     kpi_row(sub)
 
-    if chosen_code == ALL_CODE:
+    if chosen_code in (ALL_CODE, MFG_CODE):
         st.markdown("### Subsector composition")
         chart_subsector_pie(sub)
 
     st.markdown("### Geographic distribution")
-    chart_state_distribution(sub, uniform_markers=(chosen_code == ALL_CODE))
+    chart_state_distribution(sub, uniform_markers=(chosen_code in (ALL_CODE, MFG_CODE)))
 
     st.markdown("### Units per site")
     chart_units_per_site(sub)
@@ -777,8 +926,10 @@ def main() -> None:
     st.markdown("### Capacity distribution by reported unit")
     chart_capacity_distribution(sub)
 
-    with st.expander("Browse raw rows"):
-        render_data_table(sub)
+    st.markdown("### Data table (all columns)")
+    render_data_table(sub)
+
+    render_downloads(sub, chosen_code, state_filter)
 
 
 if __name__ == "__main__":

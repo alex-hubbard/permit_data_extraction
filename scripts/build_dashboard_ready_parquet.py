@@ -103,6 +103,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--in", dest="src", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--slim", action="store_true",
+                    help="keep only the app's chart columns (legacy behavior); "
+                         "default keeps every source column so the app can show "
+                         "the full table and offer downloads")
     args = ap.parse_args()
 
     # Lat/Lon are deliberately NOT baked in. The app merges centroids at load
@@ -115,7 +119,8 @@ def main():
 
     naics_final = load_naics_final()
     src = pq.ParquetFile(args.src)
-    present = [c for c in KEEP if c in src.schema_arrow.names]
+    wanted = KEEP if args.slim else list(src.schema_arrow.names)
+    present = [c for c in wanted if c in src.schema_arrow.names]
     missing = [c for c in KEEP if c not in src.schema_arrow.names]
     if missing:
         print(f"NOTE: source lacks {missing}; those derived columns will be empty")
