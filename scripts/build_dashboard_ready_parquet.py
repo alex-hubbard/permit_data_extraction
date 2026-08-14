@@ -61,7 +61,34 @@ def load_naics_final():
     return out
 
 
-def derive(df: pd.DataFrame, naics_final=None) -> pd.DataFrame:
+def build_canon_map(src_path, col, synonyms):
+    """fold(value) -> canonical display string, majority-casing across the file.
+
+    Pass 1 of the free-text cleanup: read one column, count every distinct
+    raw value, and for each folded group pick the most frequent original
+    casing as the display form. Curated synonyms override per folded key.
+    """
+    vc = pq.read_table(src_path, columns=[col]).column(0).to_pandas().value_counts()
+    groups = {}
+    for val, cnt in vc.items():
+        f = dash._fold_label(val)
+        if f is None:
+            continue
+        best = groups.get(f)
+        if best is None or cnt > best[0]:
+            display = pd.Series([val]).str.replace(r"\s+", " ", regex=True)[0]
+            groups[f] = (cnt, display.strip().rstrip(".;,"))
+    canon = {f: disp for f, (cnt, disp) in groups.items()}
+    canon.update(synonyms)
+    print(f"canon map for {col!r}: {len(vc):,} raw -> {len(set(canon.values())):,} canonical")
+    return canon
+
+
+def apply_canon(series: pd.Series, canon: dict) -> pd.Series:
+    return series.map(lambda v: canon.get(dash._fold_label(v)))
+
+
+def derive(df: pd.DataFrame, naics_final=None, canon_maps=None) -> pd.DataFrame:
     # Prefer the resolved code (permit > ECHO > derived > SIC > LLM, with the
     # 339999 catch-all excluded). The old precedence took the pipeline's
     # Classified NAICS over the permit's own code, which agreed with it only
@@ -94,6 +121,10 @@ def derive(df: pd.DataFrame, naics_final=None) -> pd.DataFrame:
     df["Capacity Unit (norm)"] = df["Capacity Unit"].apply(dash._normalize_capacity_unit)
     df["Fuel Type (norm)"] = df["Fuel Type"].apply(dash._normalize_fuel)
     df["Unit Quantity (num)"] = pd.to_numeric(df["Unit Quantity"], errors="coerce")
+    if canon_maps:
+        for col, canon in canon_maps.items():
+            if col in df.columns:
+                df[f"{col} (norm)"] = apply_canon(df[col], canon)
     df["key_state"] = df["Facility State Abbreviation"].str.upper().str.strip()
     df["key_city"] = df["Facility City"].str.upper().str.strip()
     return df
@@ -125,11 +156,17 @@ def main():
     if missing:
         print(f"NOTE: source lacks {missing}; those derived columns will be empty")
 
+    canon_maps = {}
+    for col, synonyms in (("Industry Description", dash.INDUSTRY_SYNONYMS),
+                          ("Unit Type", dash.UNIT_TYPE_SYNONYMS)):
+        if col in src.schema_arrow.names:
+            canon_maps[col] = build_canon_map(args.src, col, synonyms)
+
     writer = None
     n = 0
     try:
         for batch in src.iter_batches(batch_size=BATCH, columns=present):
-            df = derive(batch.to_pandas(), naics_final)
+            df = derive(batch.to_pandas(), naics_final, canon_maps)
             if centroids is not None:
                 df = df.merge(centroids, on=["key_state", "key_city"], how="left")
             table = pa.Table.from_pandas(df, preserve_index=False)

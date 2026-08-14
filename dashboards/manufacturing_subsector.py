@@ -260,6 +260,51 @@ def _norm_token(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
 
 
+def _fold_label(value: object) -> str | None:
+    """Fold a free-text label for grouping: trim, collapse whitespace, strip
+    trailing punctuation, lowercase. 'Winery ' / 'WINERY' / 'winery.' -> 'winery'."""
+    if pd.isna(value):
+        return None
+    s = re.sub(r"\s+", " ", str(value).strip()).rstrip(".;,")
+    return s.lower() or None
+
+
+# Folded-label synonym maps: exact folded matches only, deliberately narrow so
+# semantically distinct values (e.g. 'tall oil refinery') never get merged.
+# Shared by the app's legacy derivation path and the parquet build script.
+INDUSTRY_SYNONYMS = {
+    "winery": "Winery",
+    "winery facility": "Winery",
+    "winery operations": "Winery",
+    "winery production": "Winery",
+    "wine production": "Winery",
+    "petroleum refinery": "Petroleum Refinery",
+    "petroleum refineries": "Petroleum Refinery",
+    "petroleum refining": "Petroleum Refinery",
+    "petroleum refinery facility": "Petroleum Refinery",
+    "fully integrated petroleum refinery facility": "Petroleum Refinery",
+    "integrated petroleum refinery": "Petroleum Refinery",
+    "refinery": "Petroleum Refinery",
+    "oil refinery": "Petroleum Refinery",
+    "crude oil refinery": "Petroleum Refinery",
+}
+UNIT_TYPE_SYNONYMS: dict[str, str] = {}
+
+
+def _normalize_freetext(value: object, synonyms: dict[str, str]) -> str | None:
+    """Legacy-path normalizer: fold + synonyms, keeping the trimmed original
+    casing otherwise. The parquet build does better (majority casing across
+    the whole dataset); this keeps the xlsx fallback consistent in spirit."""
+    if pd.isna(value):
+        return None
+    folded = _fold_label(value)
+    if folded is None:
+        return None
+    if folded in synonyms:
+        return synonyms[folded]
+    return re.sub(r"\s+", " ", str(value).strip()).rstrip(".;,") or None
+
+
 def _normalize_capacity_unit(value: object) -> str | None:
     if pd.isna(value):
         return None
@@ -413,6 +458,12 @@ def load_data(
     df["Capacity Unit (norm)"] = df["Capacity Unit"].apply(_normalize_capacity_unit)
     df["Fuel Type (norm)"] = df["Fuel Type"].apply(_normalize_fuel)
     df["Unit Quantity (num)"] = pd.to_numeric(df["Unit Quantity"], errors="coerce")
+    if "Industry Description" in df.columns:
+        df["Industry Description (norm)"] = df["Industry Description"].apply(
+            lambda v: _normalize_freetext(v, INDUSTRY_SYNONYMS))
+    if "Unit Type" in df.columns:
+        df["Unit Type (norm)"] = df["Unit Type"].apply(
+            lambda v: _normalize_freetext(v, UNIT_TYPE_SYNONYMS))
 
     # Attach city-centroid coordinates for points-on-map view.
     centroids = load_city_centroids(centroids_path)
@@ -907,10 +958,15 @@ def main() -> None:
     st.markdown("### Units per site")
     chart_units_per_site(sub)
 
+    unit_type_col = ("Unit Type (norm)" if "Unit Type (norm)" in sub.columns
+                     else "Unit Type")
+    industry_col = ("Industry Description (norm)"
+                    if "Industry Description (norm)" in sub.columns
+                    else "Industry Description")
     left, right = st.columns(2)
     with left:
         st.markdown("### Top unit types")
-        chart_top_categorical(sub, "Unit Type", "Unit type", n=15)
+        chart_top_categorical(sub, unit_type_col, "Unit type", n=15)
     with right:
         st.markdown("### Top fuel types")
         chart_top_categorical(sub, "Fuel Type (norm)", "Fuel type", n=15)
@@ -921,7 +977,7 @@ def main() -> None:
         chart_top_categorical(sub, "Control Device(s)", "Control device", n=15)
     with right:
         st.markdown("### Top industry descriptions")
-        chart_top_categorical(sub, "Industry Description", "Industry description", n=15)
+        chart_top_categorical(sub, industry_col, "Industry description", n=15)
 
     st.markdown("### Capacity distribution by reported unit")
     chart_capacity_distribution(sub)
