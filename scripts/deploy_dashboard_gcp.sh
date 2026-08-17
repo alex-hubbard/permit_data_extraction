@@ -57,7 +57,7 @@ gcloud run deploy "$SERVICE" \
     --timeout 3600 \
     --session-affinity \
     --allow-unauthenticated \
-    --max-instances 2 \
+    --max-instances 1 \
     --quiet
 
 gcloud run services describe "$SERVICE" --region "$REGION" \
