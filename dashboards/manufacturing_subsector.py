@@ -740,7 +740,24 @@ def view_aggregates(code: str, states: tuple, data_path_str: str) -> dict:
     out["vintage"] = _year_counts(sub["Year of Manufacture"]) \
         if "Year of Manufacture" in sub.columns else pd.DataFrame(columns=["year", "units"])
 
-    out["cap"] = sub[["Capacity Value (num)", "Capacity Unit (norm)"]].dropna()
+    # Box-plot statistics only — never the raw column. px.box serializes every
+    # underlying point into the chart payload (tens of MB at 1.1M rows), which
+    # exceeds Cloud Run's 32 MB response limit and breaks the app remotely.
+    cap = sub[["Capacity Value (num)", "Capacity Unit (norm)"]].dropna()
+    cap = cap[cap["Capacity Value (num)"] > 0]
+    stats_rows = []
+    if not cap.empty:
+        top_units = cap["Capacity Unit (norm)"].value_counts().head(8).index
+        for unit in top_units:
+            v = cap.loc[cap["Capacity Unit (norm)"] == unit, "Capacity Value (num)"]
+            q1, med, q3 = v.quantile([0.25, 0.5, 0.75])
+            stats_rows.append({
+                "unit": str(unit), "count": len(v),
+                "lowerfence": float(v.quantile(0.025)), "q1": float(q1),
+                "median": float(med), "q3": float(q3),
+                "upperfence": float(v.quantile(0.975)),
+            })
+    out["cap_stats"] = pd.DataFrame(stats_rows)
 
     cols = export_columns(sub)
     out["export_cols"] = cols
@@ -980,37 +997,39 @@ def chart_vintage(vintage: pd.DataFrame) -> None:
     )
 
 
-def chart_capacity_distribution(cap: pd.DataFrame) -> None:
-    if cap.empty:
+def chart_capacity_distribution(cap_stats: pd.DataFrame) -> None:
+    if cap_stats.empty:
         st.info("No capacity data populated for this subsector.")
         return
 
-    unit_counts = cap["Capacity Unit (norm)"].value_counts()
-    common_units = unit_counts.head(8).index.tolist()
+    common_units = cap_stats["unit"].tolist()
     selected = st.multiselect(
         "Capacity units to compare",
         options=common_units,
         default=common_units[: min(4, len(common_units))],
         help="Capacity is reported in many units; pick a comparable set.",
     )
-    plot_df = cap[cap["Capacity Unit (norm)"].isin(selected)]
-    if plot_df.empty:
+    show = cap_stats[cap_stats["unit"].isin(selected)]
+    if show.empty:
         st.info("Pick at least one capacity unit to plot.")
         return
-    plot_df = plot_df[plot_df["Capacity Value (num)"] > 0]
-    fig = px.box(
-        plot_df,
-        x="Capacity Unit (norm)",
-        y="Capacity Value (num)",
-        log_y=True,
-        labels={
-            "Capacity Unit (norm)": "Capacity unit",
-            "Capacity Value (num)": "Capacity (log scale)",
-        },
-        points="suspectedoutliers",
-    )
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    for _, r in show.iterrows():
+        fig.add_trace(go.Box(
+            x=[r["unit"]], name=str(r["unit"]),
+            lowerfence=[r["lowerfence"]], q1=[r["q1"]], median=[r["median"]],
+            q3=[r["q3"]], upperfence=[r["upperfence"]],
+            boxpoints=False, showlegend=False,
+        ))
+    fig.update_yaxes(type="log", title="Capacity (log scale)")
+    fig.update_xaxes(title="Capacity unit")
     fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=360)
     st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "Boxes show median, quartiles, and 2.5–97.5th percentile whiskers; "
+        f"{int(show['count'].sum()):,} units across the selected capacity units."
+    )
 
 
 # Internal plumbing columns kept out of the table and the export files.
@@ -1071,27 +1090,45 @@ def render_downloads(code: str, state_filter: list[str], data_path_str: str,
     for c in export.select_dtypes(include="category").columns:
         export[c] = export[c].cat.remove_unused_categories()
 
+    # Cloud Run caps any single response at 32 MB; a larger download would
+    # 500 mid-transfer. Locally there is no cap.
+    hosted_limit = 30_000_000 if os.environ.get("K_SERVICE") else None
+
     buf = io.BytesIO()
     export.to_parquet(buf, index=False)
+    parquet_bytes = buf.getvalue()
     c1, c2 = st.columns(2)
     with c1:
-        st.download_button(
-            "Download Parquet (recommended)",
-            data=buf.getvalue(),
-            file_name=f"{slug}.parquet",
-            mime="application/octet-stream",
-            use_container_width=True,
-        )
+        if hosted_limit and len(parquet_bytes) > hosted_limit:
+            st.caption(
+                f"This selection is {len(parquet_bytes)/1e6:.0f} MB as Parquet — "
+                "over this host's 32 MB download limit. Narrow the selection "
+                "with a subsector or state filter."
+            )
+        else:
+            st.download_button(
+                "Download Parquet (recommended)",
+                data=parquet_bytes,
+                file_name=f"{slug}.parquet",
+                mime="application/octet-stream",
+                use_container_width=True,
+            )
     with c2:
         if n <= CSV_MAX_ROWS:
             csv_bytes = export.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "Download CSV",
-                data=csv_bytes,
-                file_name=f"{slug}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+            if hosted_limit and len(csv_bytes) > hosted_limit:
+                st.caption(
+                    "CSV for this selection exceeds this host's 32 MB download "
+                    "limit — use Parquet or narrow the selection."
+                )
+            else:
+                st.download_button(
+                    "Download CSV",
+                    data=csv_bytes,
+                    file_name=f"{slug}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
         else:
             st.caption(
                 f"CSV export is capped at {CSV_MAX_ROWS:,} rows; narrow the "
@@ -1204,7 +1241,7 @@ def main() -> None:
         chart_top_categorical(view["top_industry"], "Industry description")
 
     st.markdown("### Capacity distribution by reported unit")
-    chart_capacity_distribution(view["cap"])
+    chart_capacity_distribution(view["cap_stats"])
 
     st.markdown("### Data table (all columns)")
     render_data_table(view["table_head"], view["n"], len(view["export_cols"]))
