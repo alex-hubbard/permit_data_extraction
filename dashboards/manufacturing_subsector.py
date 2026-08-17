@@ -628,6 +628,63 @@ def _pref(sub: pd.DataFrame, col: str) -> str:
     return norm if norm in sub.columns else col
 
 
+_YEAR_RE = re.compile(r"(19[0-9]{2}|20[0-2][0-9])")
+
+# Placeholder strings that masquerade as makes/models.
+_PLACEHOLDER_VALUES = {
+    "unknown", "n/a", "na", "none", "not specified", "not available",
+    "not listed", "unspecified", "various", "-", "--", "unk", "tbd",
+}
+
+
+def _is_placeholder(value: str) -> bool:
+    return value.strip().lower() in _PLACEHOLDER_VALUES
+
+
+def _year_counts(series: pd.Series) -> pd.DataFrame:
+    """Units per year of manufacture. Parses the year out of each *unique*
+    label (labels include '1998', '1998.0', '~1995', 'circa 1987'), so the
+    cost scales with distinct values, not rows."""
+    vc = series.dropna().value_counts()
+    vc = vc[vc > 0]
+    years: dict[int, int] = {}
+    for label, cnt in vc.items():
+        m = _YEAR_RE.search(str(label))
+        if m:
+            y = int(m.group(1))
+            if y > 2026:  # OCR/typo future years
+                continue
+            years[y] = years.get(y, 0) + int(cnt)
+    if not years:
+        return pd.DataFrame(columns=["year", "units"])
+    return pd.DataFrame(sorted(years.items()), columns=["year", "units"])
+
+
+def _make_model_counts(sub: pd.DataFrame, n: int) -> pd.DataFrame:
+    """Top make+model pairs ('Caterpillar 3512' — a bare model number is
+    meaningless without its make)."""
+    make_col, model_col = _pref(sub, "Unit Make"), "Unit Model"
+    if make_col not in sub.columns or model_col not in sub.columns:
+        return pd.DataFrame(columns=["value", "count"])
+    pairs = (
+        sub.dropna(subset=[make_col, model_col])
+        .groupby([make_col, model_col], observed=True)
+        .size()
+        .sort_values(ascending=False)
+    )
+    rows = []
+    for (make, model), cnt in pairs.items():
+        make_s, model_s = str(make).strip(), str(model).strip()
+        if not make_s or not model_s:
+            continue
+        if _is_placeholder(make_s) or _is_placeholder(model_s):
+            continue
+        rows.append((f"{make_s} {model_s}", int(cnt)))
+        if len(rows) == n:
+            break
+    return pd.DataFrame(rows, columns=["value", "count"])
+
+
 @st.cache_data(max_entries=12, show_spinner="Crunching view…")
 def view_aggregates(code: str, states: tuple, data_path_str: str) -> dict:
     """Everything the charts need for one (subsector, states) selection,
@@ -675,6 +732,13 @@ def view_aggregates(code: str, states: tuple, data_path_str: str) -> dict:
     out["top_fuel"] = _top_counts(sub[_pref(sub, "Fuel Type")], 15)
     out["top_control"] = _top_counts(sub[_pref(sub, "Control Device(s)")], 15)
     out["top_industry"] = _top_counts(sub[_pref(sub, "Industry Description")], 15)
+
+    # 'None' is meaningful for control devices but noise for makes.
+    top_make = _top_counts(sub[_pref(sub, "Unit Make")], 25)
+    out["top_make"] = top_make[~top_make["value"].map(_is_placeholder)].head(15)
+    out["top_model"] = _make_model_counts(sub, 15)
+    out["vintage"] = _year_counts(sub["Year of Manufacture"]) \
+        if "Year of Manufacture" in sub.columns else pd.DataFrame(columns=["year", "units"])
 
     out["cap"] = sub[["Capacity Value (num)", "Capacity Unit (norm)"]].dropna()
 
@@ -893,6 +957,29 @@ def chart_top_categorical(top: pd.DataFrame, title: str) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
+def chart_vintage(vintage: pd.DataFrame) -> None:
+    if vintage.empty:
+        st.info("No year-of-manufacture data populated for this selection.")
+        return
+    v = vintage[vintage["year"] >= 1940]
+    total = int(v["units"].sum())
+    if total == 0:
+        st.info("No year-of-manufacture data populated for this selection.")
+        return
+    cum = v["units"].cumsum()
+    median_year = int(v.loc[cum >= total / 2, "year"].iloc[0])
+    fig = px.bar(v, x="year", y="units",
+                 labels={"year": "Year of manufacture", "units": "Units"})
+    fig.add_vline(x=median_year, line_dash="dash",
+                  annotation_text=f"median {median_year}")
+    fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=320, bargap=0.05)
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        f"{total:,} units state a year of manufacture (pre-1940 omitted). "
+        f"Median vintage: {median_year}."
+    )
+
+
 def chart_capacity_distribution(cap: pd.DataFrame) -> None:
     if cap.empty:
         st.info("No capacity data populated for this subsector.")
@@ -1096,6 +1183,17 @@ def main() -> None:
     with right:
         st.markdown("### Top fuel types")
         chart_top_categorical(view["top_fuel"], "Fuel type")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("### Top manufacturers")
+        chart_top_categorical(view["top_make"], "Manufacturer")
+    with right:
+        st.markdown("### Top make + model")
+        chart_top_categorical(view["top_model"], "Make and model")
+
+    st.markdown("### Equipment vintage")
+    chart_vintage(view["vintage"])
 
     left, right = st.columns(2)
     with left:
