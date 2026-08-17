@@ -290,6 +290,71 @@ INDUSTRY_SYNONYMS = {
 }
 UNIT_TYPE_SYNONYMS: dict[str, str] = {}
 
+FUEL_SYNONYMS = {
+    "nat. gas": "Natural Gas",
+    "nat gas": "Natural Gas",
+    "natural gas only": "Natural Gas",
+    "pipeline natural gas": "Natural Gas",
+    "pipeline-quality natural gas": "Natural Gas",
+    "pipeline quality natural gas": "Natural Gas",
+    "no. 2 fuel oil": "No. 2 Fuel Oil",
+    "no 2 fuel oil": "No. 2 Fuel Oil",
+    "#2 fuel oil": "No. 2 Fuel Oil",
+    "number 2 fuel oil": "No. 2 Fuel Oil",
+    "fuel oil no. 2": "No. 2 Fuel Oil",
+    "fuel oil #2": "No. 2 Fuel Oil",
+    "diesel fuel": "Diesel",
+    "diesel oil": "Diesel",
+    "diesel fuel oil": "Diesel",
+    "ultra low sulfur diesel": "Diesel (ULSD)",
+    "ultra-low sulfur diesel": "Diesel (ULSD)",
+    "ulsd": "Diesel (ULSD)",
+    "liquefied petroleum gas": "LPG",
+    "lpg": "LPG",
+}
+
+MAKE_SYNONYMS = {
+    "caterpillar": "Caterpillar",
+    "cat": "Caterpillar",
+    "cummins inc": "Cummins",
+    "cummins engine company": "Cummins",
+    "cummins engine co": "Cummins",
+    "detroit diesel corporation": "Detroit Diesel",
+    "detroit diesel corp": "Detroit Diesel",
+    "general electric": "GE",
+    "ge": "GE",
+    "babcock & wilcox": "Babcock & Wilcox",
+    "babcock and wilcox": "Babcock & Wilcox",
+    "b&w": "Babcock & Wilcox",
+    "cleaver brooks": "Cleaver-Brooks",
+    "cleaver-brooks": "Cleaver-Brooks",
+    "solar turbines incorporated": "Solar Turbines",
+    "solar turbines inc": "Solar Turbines",
+    "ingersoll rand": "Ingersoll-Rand",
+    "ingersoll-rand": "Ingersoll-Rand",
+    "john deere": "John Deere",
+}
+
+# Columns the parquet build canonicalizes into "<col> (norm)", with their
+# curated synonym maps. Majority-casing folding applies to all of them.
+CANON_COLUMNS = [
+    ("Industry Description", INDUSTRY_SYNONYMS),
+    ("Unit Type", UNIT_TYPE_SYNONYMS),
+    ("Fuel Type", FUEL_SYNONYMS),
+    ("Control Device(s)", {}),
+    ("Unit Make", MAKE_SYNONYMS),
+    ("Regulatory Authority", {}),
+    ("Facility City", {}),
+    ("Facility County", {}),
+]
+
+VALID_STATE_CODES = {
+    "AL","AK","AZ","AR","CA","CO","CT","DE","DC","FL","GA","HI","ID","IL",
+    "IN","IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE",
+    "NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD",
+    "TN","TX","UT","VT","VA","WA","WV","WI","WY","PR","VI","GU","AS","MP",
+}
+
 
 def _normalize_freetext(value: object, synonyms: dict[str, str]) -> str | None:
     """Legacy-path normalizer: fold + synonyms, keeping the trimmed original
@@ -328,7 +393,10 @@ def _digits_only(value: object) -> str | None:
     return s or None
 
 
-@st.cache_data(show_spinner="Loading FRS city centroids…")
+# cache_resource, not cache_data: cache_data hands every caller a fresh
+# pickled COPY of the return value, which at 1.1M rows costs seconds per
+# widget interaction. The cached frames are treated as read-only.
+@st.cache_resource(show_spinner="Loading FRS city centroids…")
 def load_city_centroids(csv_path: Path, parquet_path: Path = CENTROIDS_PARQUET) -> pd.DataFrame:
     """Median lat/lon per (state, city) from EPA FRS, used to plot facility points.
 
@@ -377,7 +445,7 @@ _DERIVED_COLUMNS = frozenset(
 )
 
 
-@st.cache_data(show_spinner="Loading permit dataset…")
+@st.cache_resource(show_spinner="Loading permit dataset…")
 def load_data(
     xlsx_path: Path,
     centroids_path: Path,
@@ -536,6 +604,86 @@ def subsector_options(df: pd.DataFrame) -> list[tuple[str, str]]:
     return items
 
 
+def _load_df(data_path_str: str) -> pd.DataFrame:
+    return load_data(Path(data_path_str), FRS_FACILITIES_PATH)
+
+
+@st.cache_resource(max_entries=4, show_spinner=False)
+def get_subset(code: str, states: tuple, data_path_str: str) -> pd.DataFrame:
+    """Filtered view of the dataset, shared (not copied) across reruns."""
+    sub = filter_by_option(_load_df(data_path_str), code)
+    if states:
+        sub = sub[sub["Facility State Abbreviation"].isin(states)]
+    return sub
+
+
+@st.cache_data(show_spinner=False)
+def cached_options(data_path_str: str) -> list[tuple[str, str]]:
+    return subsector_options(_load_df(data_path_str))
+
+
+def _pref(sub: pd.DataFrame, col: str) -> str:
+    """Prefer the normalized variant of a column when the file carries it."""
+    norm = f"{col} (norm)"
+    return norm if norm in sub.columns else col
+
+
+@st.cache_data(max_entries=12, show_spinner="Crunching view…")
+def view_aggregates(code: str, states: tuple, data_path_str: str) -> dict:
+    """Everything the charts need for one (subsector, states) selection,
+    computed in a single pass and cached. The heavy per-rerun groupbys were
+    what made the app crawl at 1.1M rows."""
+    sub = get_subset(code, states, data_path_str)
+    out: dict = {"n": len(sub)}
+
+    # observed=True everywhere: Site Key is categorical, and the default
+    # (observed=False) emits a zero-size group for every category absent
+    # from the filtered view — wrong medians and a 33k-row site table.
+    ups = sub.groupby("Site Key", observed=True).size()
+    out["kpi"] = {
+        "facilities": int(sub["Site Key"].nunique()),
+        "units": len(sub),
+        "states": int(sub["Facility State Abbreviation"].nunique()),
+        "median_units": float(ups.median()) if len(ups) else 0.0,
+        "permits": int(sub["Permit Number"].nunique()) if "Permit Number" in sub.columns else 0,
+        "documents": int(sub["Filename"].nunique()) if "Filename" in sub.columns else 0,
+    }
+    out["ups"] = ups.rename("units").reset_index()
+
+    if code in (ALL_CODE, MFG_CODE):
+        bucket = _primary_bucket(sub).fillna("Unclassified")
+        vc = bucket.value_counts()
+        if len(vc) > 14:
+            vc = pd.concat([vc.head(13),
+                            pd.Series({"Other subsectors": int(vc.iloc[13:].sum())})])
+        out["pie"] = vc.rename_axis("Subsector").reset_index(name="units")
+    else:
+        out["pie"] = None
+
+    out["sites"] = (
+        sub.groupby("Site Key", observed=True)
+        .agg(facility=("Facility Name", "first"),
+             city=("Facility City", "first"),
+             state=("Facility State Abbreviation", "first"),
+             units=("Site Key", "size"),
+             lat=("Lat", "first"),
+             lon=("Lon", "first"))
+        .reset_index(drop=True)
+    )
+
+    out["top_unit_type"] = _top_counts(sub[_pref(sub, "Unit Type")], 15)
+    out["top_fuel"] = _top_counts(sub[_pref(sub, "Fuel Type")], 15)
+    out["top_control"] = _top_counts(sub[_pref(sub, "Control Device(s)")], 15)
+    out["top_industry"] = _top_counts(sub[_pref(sub, "Industry Description")], 15)
+
+    out["cap"] = sub[["Capacity Value (num)", "Capacity Unit (norm)"]].dropna()
+
+    cols = export_columns(sub)
+    out["export_cols"] = cols
+    out["table_head"] = sub[cols].head(500)
+    return out
+
+
 def option_display_name(code: str) -> str:
     if code == ALL_CODE:
         return "Entire dataset"
@@ -550,22 +698,14 @@ def option_display_name(code: str) -> str:
     return f"{code} — {subsector_label(code)}"
 
 
-def kpi_row(sub: pd.DataFrame) -> None:
-    facilities = sub["Site Key"].nunique()
-    units = len(sub)
-    states = sub["Facility State Abbreviation"].nunique()
-    units_per_site = sub.groupby("Site Key").size()
-    median_units = float(units_per_site.median()) if len(units_per_site) else 0.0
-    permits = sub["Permit Number"].nunique() if "Permit Number" in sub.columns else 0
-    documents = sub["Filename"].nunique() if "Filename" in sub.columns else 0
-
+def kpi_row(k: dict) -> None:
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Facilities (sites)", f"{facilities:,}")
-    c2.metric("Permits", f"{permits:,}")
-    c3.metric("Permit documents", f"{documents:,}")
-    c4.metric("Emission units", f"{units:,}")
-    c5.metric("States represented", f"{states}")
-    c6.metric("Median units / site", f"{median_units:.0f}")
+    c1.metric("Facilities (sites)", f"{k['facilities']:,}")
+    c2.metric("Permits", f"{k['permits']:,}")
+    c3.metric("Permit documents", f"{k['documents']:,}")
+    c4.metric("Emission units", f"{k['units']:,}")
+    c5.metric("States represented", f"{k['states']}")
+    c6.metric("Median units / site", f"{k['median_units']:.0f}")
 
 
 def _primary_bucket(sub: pd.DataFrame) -> pd.Series:
@@ -590,15 +730,9 @@ def _primary_bucket(sub: pd.DataFrame) -> pd.Series:
     return label
 
 
-def chart_subsector_pie(sub: pd.DataFrame) -> None:
+def chart_subsector_pie(counts: pd.DataFrame) -> None:
     """Pie of subsector composition for the aggregate scopes."""
-    bucket = _primary_bucket(sub).fillna("Unclassified")
-    vc = bucket.value_counts()
-    if len(vc) > 14:
-        vc = pd.concat([vc.head(13),
-                        pd.Series({"Other subsectors": int(vc.iloc[13:].sum())})])
-    counts = vc.rename_axis("Subsector").reset_index(name="units")
-    if counts.empty:
+    if counts is None or counts.empty:
         st.info("No rows to summarize.")
         return
     fig = px.pie(
@@ -616,20 +750,16 @@ def chart_subsector_pie(sub: pd.DataFrame) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
-def chart_state_distribution(sub: pd.DataFrame, uniform_markers: bool = False) -> None:
-    sites = (
-        sub.groupby("Site Key")
-        .agg(
-            facility=("Facility Name", "first"),
-            city=("Facility City", "first"),
-            state=("Facility State Abbreviation", "first"),
-            units=("Site Key", "size"),
-            lat=("Lat", "first"),
-            lon=("Lon", "first"),
-        )
-        .reset_index(drop=True)
-    )
+MAX_MAP_POINTS = 8000
+
+
+def chart_state_distribution(sites: pd.DataFrame, uniform_markers: bool = False) -> None:
     plotted = sites.dropna(subset=["lat", "lon"])
+    capped = len(plotted) > MAX_MAP_POINTS
+    if capped:
+        # Browser-side rendering chokes on tens of thousands of markers;
+        # keep the largest sites, which carry the visual story anyway.
+        plotted = plotted.nlargest(MAX_MAP_POINTS, "units")
 
     map_col, bar_col = st.columns([1.4, 1])
     with map_col:
@@ -681,7 +811,8 @@ def chart_state_distribution(sub: pd.DataFrame, uniform_markers: bool = False) -
             missing = len(sites) - len(plotted)
             base_caption = (
                 f"{len(plotted):,} of {len(sites):,} sites plotted"
-                + (f" — {missing:,} could not be geocoded" if missing else "")
+                + (f" — showing the {MAX_MAP_POINTS:,} largest sites" if capped else "")
+                + (f" — {missing:,} not geocoded or below the size cutoff" if missing else "")
                 + ". Points are FRS city centroids; co-located facilities overlap."
             )
             st.caption(base_caption)
@@ -689,7 +820,7 @@ def chart_state_distribution(sub: pd.DataFrame, uniform_markers: bool = False) -
     with bar_col:
         by_state = (
             sites.dropna(subset=["state"])
-            .groupby("state")
+            .groupby("state", observed=True)
             .agg(facilities=("facility", "nunique"), units=("units", "sum"))
             .reset_index()
             .sort_values("facilities", ascending=False)
@@ -710,8 +841,7 @@ def chart_state_distribution(sub: pd.DataFrame, uniform_markers: bool = False) -
         st.plotly_chart(fig_bar, use_container_width=True)
 
 
-def chart_units_per_site(sub: pd.DataFrame) -> None:
-    units_per_site = sub.groupby("Site Key").size().rename("units").reset_index()
+def chart_units_per_site(units_per_site: pd.DataFrame) -> None:
     if units_per_site.empty:
         return
     cap = int(units_per_site["units"].quantile(0.99))
@@ -732,22 +862,23 @@ def chart_units_per_site(sub: pd.DataFrame) -> None:
 
 
 def _top_counts(series: pd.Series, n: int) -> pd.DataFrame:
-    counts = series.dropna().astype(str).str.strip()
-    counts = counts[counts != ""]
-    if counts.empty:
+    # Count first, clean after: value_counts on a categorical is near-free,
+    # while .astype(str).str.strip() on the full column materializes millions
+    # of Python strings (measured: ~47 s and gigabytes at 1.1M rows).
+    vc = series.dropna().value_counts()
+    vc = vc[vc > 0]
+    if vc.empty:
         return pd.DataFrame(columns=["value", "count"])
-    return (
-        counts.value_counts()
-        .head(n)
-        .rename_axis("value")
-        .reset_index(name="count")
-    )
+    labels = vc.index.astype(str).str.strip()
+    vc = pd.Series(vc.values, index=labels)
+    vc = vc[vc.index != ""]
+    if vc.empty:
+        return pd.DataFrame(columns=["value", "count"])
+    vc = vc.groupby(level=0).sum().sort_values(ascending=False)
+    return vc.head(n).rename_axis("value").reset_index(name="count")
 
 
-def chart_top_categorical(
-    sub: pd.DataFrame, column: str, title: str, n: int = 15
-) -> None:
-    top = _top_counts(sub[column], n)
+def chart_top_categorical(top: pd.DataFrame, title: str) -> None:
     if top.empty:
         st.info(f"No data for {title.lower()}.")
         return
@@ -762,8 +893,7 @@ def chart_top_categorical(
     st.plotly_chart(fig, use_container_width=True)
 
 
-def chart_capacity_distribution(sub: pd.DataFrame) -> None:
-    cap = sub.dropna(subset=["Capacity Value (num)", "Capacity Unit (norm)"]).copy()
+def chart_capacity_distribution(cap: pd.DataFrame) -> None:
     if cap.empty:
         st.info("No capacity data populated for this subsector.")
         return
@@ -821,11 +951,10 @@ def export_columns(sub: pd.DataFrame) -> list[str]:
     return lead + rest
 
 
-def render_data_table(sub: pd.DataFrame) -> None:
-    cols = export_columns(sub)
-    st.dataframe(sub[cols].head(500), use_container_width=True, height=380)
+def render_data_table(table_head: pd.DataFrame, total_rows: int, n_cols: int) -> None:
+    st.dataframe(table_head, use_container_width=True, height=380)
     st.caption(
-        f"Showing first 500 of {len(sub):,} rows — all {len(cols)} data columns. "
+        f"Showing first 500 of {total_rows:,} rows — all {n_cols} data columns. "
         "Use the download buttons below for the complete selection."
     )
 
@@ -835,10 +964,9 @@ def render_data_table(sub: pd.DataFrame) -> None:
 CSV_MAX_ROWS = 250_000
 
 
-def render_downloads(sub: pd.DataFrame, code: str, state_filter: list[str]) -> None:
+def render_downloads(code: str, state_filter: list[str], data_path_str: str,
+                     n: int, cols: list[str]) -> None:
     st.markdown("### Download this selection")
-    cols = export_columns(sub)
-    n = len(sub)
     slug = "permit_units_" + (code.lower() if code else "all")
     if state_filter:
         slug += "_" + "-".join(s.lower() for s in sorted(state_filter)[:5])
@@ -849,6 +977,7 @@ def render_downloads(sub: pd.DataFrame, code: str, state_filter: list[str]) -> N
     )
     if not prepare:
         return
+    sub = get_subset(code, tuple(state_filter), data_path_str)
     export = sub[cols].copy()
     # Filtered frames inherit the full dataset's category dictionaries, which
     # bloats the written file; drop the unused entries first.
@@ -915,8 +1044,7 @@ def main() -> None:
             st.error(f"Neither remote URI, local parquet, nor xlsx available. {BUILD_HINT}")
             st.stop()
 
-    df = load_data(data_path, FRS_FACILITIES_PATH)
-    options = subsector_options(df)
+    options = cached_options(data_path_str)
     if not options:
         st.error("No subsector rows found in the dataset.")
         st.stop()
@@ -929,12 +1057,14 @@ def main() -> None:
         chosen_code = codes[labels.index(choice)]
 
         st.header("Filters")
-        states_available = sorted(df["Facility State Abbreviation"].dropna().unique())
+        df = _load_df(data_path_str)
+        states_available = sorted(
+            set(df["Facility State Abbreviation"].dropna().unique())
+            & VALID_STATE_CODES
+        )
         state_filter = st.multiselect("States", options=states_available, default=[])
 
-    sub = filter_by_option(df, chosen_code)
-    if state_filter:
-        sub = sub[sub["Facility State Abbreviation"].isin(state_filter)]
+    view = view_aggregates(chosen_code, tuple(state_filter), data_path_str)
 
     st.subheader(option_display_name(chosen_code))
     if chosen_code == ALL_CODE:
@@ -942,50 +1072,47 @@ def main() -> None:
             "Every unit-level record extracted from state and district air "
             "permits. Select a subsector in the sidebar to drill down."
         )
-    if sub.empty:
+    if view["n"] == 0:
         st.warning("No rows match the current filters.")
         return
 
-    kpi_row(sub)
+    kpi_row(view["kpi"])
 
-    if chosen_code in (ALL_CODE, MFG_CODE):
+    if view["pie"] is not None:
         st.markdown("### Subsector composition")
-        chart_subsector_pie(sub)
+        chart_subsector_pie(view["pie"])
 
     st.markdown("### Geographic distribution")
-    chart_state_distribution(sub, uniform_markers=(chosen_code in (ALL_CODE, MFG_CODE)))
+    chart_state_distribution(view["sites"],
+                             uniform_markers=(chosen_code in (ALL_CODE, MFG_CODE)))
 
     st.markdown("### Units per site")
-    chart_units_per_site(sub)
+    chart_units_per_site(view["ups"])
 
-    unit_type_col = ("Unit Type (norm)" if "Unit Type (norm)" in sub.columns
-                     else "Unit Type")
-    industry_col = ("Industry Description (norm)"
-                    if "Industry Description (norm)" in sub.columns
-                    else "Industry Description")
     left, right = st.columns(2)
     with left:
         st.markdown("### Top unit types")
-        chart_top_categorical(sub, unit_type_col, "Unit type", n=15)
+        chart_top_categorical(view["top_unit_type"], "Unit type")
     with right:
         st.markdown("### Top fuel types")
-        chart_top_categorical(sub, "Fuel Type (norm)", "Fuel type", n=15)
+        chart_top_categorical(view["top_fuel"], "Fuel type")
 
     left, right = st.columns(2)
     with left:
         st.markdown("### Top control devices")
-        chart_top_categorical(sub, "Control Device(s)", "Control device", n=15)
+        chart_top_categorical(view["top_control"], "Control device")
     with right:
         st.markdown("### Top industry descriptions")
-        chart_top_categorical(sub, industry_col, "Industry description", n=15)
+        chart_top_categorical(view["top_industry"], "Industry description")
 
     st.markdown("### Capacity distribution by reported unit")
-    chart_capacity_distribution(sub)
+    chart_capacity_distribution(view["cap"])
 
     st.markdown("### Data table (all columns)")
-    render_data_table(sub)
+    render_data_table(view["table_head"], view["n"], len(view["export_cols"]))
 
-    render_downloads(sub, chosen_code, state_filter)
+    render_downloads(chosen_code, state_filter, data_path_str,
+                     view["n"], view["export_cols"])
 
 
 if __name__ == "__main__":

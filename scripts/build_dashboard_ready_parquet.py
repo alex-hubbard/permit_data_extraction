@@ -78,7 +78,12 @@ def build_canon_map(src_path, col, synonyms):
         if best is None or cnt > best[0]:
             display = pd.Series([val]).str.replace(r"\s+", " ", regex=True)[0]
             groups[f] = (cnt, display.strip().rstrip(".;,"))
-    canon = {f: disp for f, (cnt, disp) in groups.items()}
+    canon = {}
+    for f, (cnt, disp) in groups.items():
+        # If the majority spelling is fully lowercase, title-case it for
+        # display ('natural gas' -> 'Natural Gas'); mixed-case winners are
+        # kept verbatim so acronyms and brand casing survive.
+        canon[f] = disp.title() if disp.islower() else disp
     canon.update(synonyms)
     print(f"canon map for {col!r}: {len(vc):,} raw -> {len(set(canon.values())):,} canonical")
     return canon
@@ -157,8 +162,7 @@ def main():
         print(f"NOTE: source lacks {missing}; those derived columns will be empty")
 
     canon_maps = {}
-    for col, synonyms in (("Industry Description", dash.INDUSTRY_SYNONYMS),
-                          ("Unit Type", dash.UNIT_TYPE_SYNONYMS)):
+    for col, synonyms in dash.CANON_COLUMNS:
         if col in src.schema_arrow.names:
             canon_maps[col] = build_canon_map(args.src, col, synonyms)
 
