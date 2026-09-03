@@ -113,7 +113,7 @@ def cmd_build(args):
                 if stem in seen:
                     continue
                 seen.add(stem)
-                txt = TEXT_DIR / (stem + ".txt")
+                txt = (Path(args.text_dir) if args.text_dir else TEXT_DIR) / (stem + ".txt")
                 if not txt.exists():
                     n_missing += 1
                     continue
@@ -175,6 +175,7 @@ def main():
     b.add_argument("--model", default="gemini-2.5-flash")
     b.add_argument("--chunk-chars", type=int, default=80_000)
     b.add_argument("--limit", type=int, default=0)
+    b.add_argument("--text-dir", default=None, help="override text directory (default data/interim/extracted_text)")
     b.set_defaults(fn=cmd_build)
     s = sub.add_parser("submit")
     s.add_argument("inputs")

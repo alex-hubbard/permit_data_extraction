@@ -39,7 +39,16 @@ def main():
     ap.add_argument("--rows-csv", type=Path, required=True)
     ap.add_argument("--source-run", required=True)
     ap.add_argument("--processing-date", required=True)
+    ap.add_argument("--replace-files", default=None,
+                    help="comma-separated Filenames (or @path to a newline list) whose OLD union rows are "
+                         "dropped and replaced by the incoming rows (re-extraction of ERROR/failed files)")
     args = ap.parse_args()
+    replace = set()
+    if args.replace_files:
+        if args.replace_files.startswith("@"):
+            replace = {l.strip() for l in Path(args.replace_files[1:]).read_text().splitlines() if l.strip()}
+        else:
+            replace = {x.strip() for x in args.replace_files.split(",") if x.strip()}
 
     with args.union_in.open(encoding="utf-8", errors="replace", newline="") as f:
         union_cols = next(csv.reader(f))
@@ -70,8 +79,15 @@ def main():
         r_union = csv.reader(fin)
         next(r_union)
         w.writerow(union_cols)
+        n_dropped = 0
         for row in r_union:
+            if replace and len(row) > fn_i and row[fn_i] in replace:
+                n_dropped += 1
+                continue
             w.writerow(row)
+        if replace:
+            print(f"dropped {n_dropped:,} old rows for {len(replace)} replaced files", flush=True)
+            existing -= replace
         r_new = csv.DictReader(fnew, fieldnames=new_cols)
         next(r_new)  # header
         for rec in r_new:
