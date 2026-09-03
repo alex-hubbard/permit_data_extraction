@@ -7,7 +7,12 @@ Pipeline:
      data/raw/echo_air_majors/).
   2. Match union-dataset facilities to ECHO facilities within each state by
      normalized facility name (exact, then fuzzy via rapidfuzz). Coverage =
-     fraction of ECHO majors matched by at least one union facility.
+     fraction of ECHO majors matched by at least one union facility. Each
+     document contributes the name the LLM read off the permit AND, where
+     build_facility_name_aliases.py could supply one, the name its source
+     agency's index uses -- the permit's printed name is often a plant or
+     unit name while ECHO carries the registry name, so the alias join
+     recovers facilities the dataset already holds (worth ~12 points in TX).
   3. Aggregate coverage nationally, by state (with well/partial/sparse tiers),
      by 2-digit NAICS sector, and by county FIPS.
   4. Merge county coverage with CBP county-level establishment counts (total
@@ -23,14 +28,15 @@ Outputs (data/processed/analysis/):
   echo_union_matches.csv             matched pairs audit (name, score, type)
 
 Caveats: name matching is conservative (normalized exact or token-set >= the
---threshold cutoff within the same state) but not perfect — chains with many
+--threshold cutoff within the same state) but not perfect; echo_union_matches.csv
+records whether each match came from an extracted or a source-index name — chains with many
 same-state plants can over-match, heavy name variants under-match. Treat
 coverage as an estimate; the audit CSV supports spot-checking. The legacy
 distinct-facility-name ratio is retained for continuity and can exceed 1.
 
 Usage:
     python scripts/benchmark_coverage_vs_echo.py [--refresh-echo]
-        [--threshold 93] [--cbp-year 2022]
+        [--threshold 93] [--cbp-year 2022] [--no-aliases] [--out-dir DIR]
 """
 
 import argparse
@@ -41,6 +47,7 @@ import re
 import time
 import urllib.request
 import zipfile
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import pandas as pd
@@ -105,6 +112,23 @@ NAME_SUFFIXES = {
     "LLC", "INC", "INCORPORATED", "CORP", "CORPORATION", "CO", "COMPANY",
     "LP", "LLP", "LTD", "PLC", "LLLP", "PC", "PA",
 }
+
+
+# Facility-generic words: they say what a site IS, not which site it is, so a
+# fuzzy match resting only on these is noise ("COMPRESSOR STATION 1" scores 100
+# against every compressor station in the state under token_set_ratio, which
+# ignores the tokens the candidate lacks).
+GENERIC_TOKENS = {
+    "STATION", "COMPRESSOR", "PLANT", "FACILITY", "SITE", "UNIT", "LANDFILL",
+    "TERMINAL", "BATTERY", "LEASE", "WELL", "PAD", "TANK", "GAS", "OIL",
+}
+
+
+def distinctive(norm):
+    """Tokens that identify WHICH facility: drop generic words and bare numbers
+    (keep short but identifying ones like 3M or BP)."""
+    return {t for t in norm.split()
+            if len(t) >= 2 and not t.isdigit() and t not in GENERIC_TOKENS}
 
 
 def norm_name(s):
@@ -228,31 +252,64 @@ def fetch_asm_state(year, key, naics="31-33"):
         ["state"] + [f"asm_{c.lower()}" for c in num]]
 
 
-def match_union_to_echo(echo, union_fac, threshold):
+def match_union_to_echo(echo, union_fac, threshold, min_shared=2, rare_df=6):
     """Flag each ECHO facility matched/unmatched by a union facility name
-    (same state, normalized-exact or fuzzy token_set >= threshold)."""
+    (same state, normalized-exact or fuzzy token_set >= threshold).
+
+    A fuzzy hit must also agree on `min_shared` distinctive words, or on one
+    word rare enough in that state's ECHO universe (appearing in <= rare_df
+    names) to identify a facility by itself. Without the guard token_set_ratio
+    matches any name that is a token-subset of another -- a one-word
+    "FIBERGLASS" scores 100 against "LONESTAR FIBERGLASS POOLS KINGSBURY
+    PLANT", and "COMPRESSOR STATION 1" scores 100 against every compressor
+    station in Texas -- while the rare-word escape keeps the true subset
+    matches ("MIRAMAR LANDFILL" for "SD CITY MIRAMAR LANDFILL"). Pass
+    min_shared=0 for the old, looser behaviour."""
     echo = echo.copy()
     echo["norm"] = echo["AIRName"].map(norm_name)
     by_state = {st: g for st, g in
                 union_fac.groupby("state")["norm"].agg(lambda s: sorted(set(s))).items()}
+    # (state, norm) -> where the name came from; an extracted name wins a tie
+    # so alias-only matches are the ones the alias join genuinely added.
+    src = {}
+    for st, nm, ns in zip(union_fac["state"], union_fac["norm"],
+                          union_fac.get("name_source", "extracted")):
+        if src.get((st, nm)) != "extracted":
+            src[(st, nm)] = ns
+    tokens = {nm: distinctive(nm) for nm in union_fac["norm"]}
+    # per-state document frequency of each word across the ECHO universe: how
+    # many facilities in the state a shared word could be pointing at
+    doc_freq = defaultdict(Counter)
+    for st, en in zip(echo["AIRState"], echo["norm"]):
+        doc_freq[st].update(distinctive(en))
     matched, match_rows = [], []
     for st, g in echo.groupby("AIRState"):
         names = by_state.get(st, [])
         name_set = set(names)
+        df = doc_freq[st]
         for idx, en in zip(g.index, g["norm"]):
             if en in name_set:
                 matched.append(idx)
-                match_rows.append((st, echo.at[idx, "AIRName"], en, 100, "exact"))
+                match_rows.append((st, echo.at[idx, "AIRName"], en, 100, "exact",
+                                   src.get((st, en), "extracted")))
             elif len(en) >= 6 and names:
-                hit = process.extractOne(en, names, scorer=fuzz.token_set_ratio,
-                                         score_cutoff=threshold)
-                if hit:
+                en_tok = distinctive(en)
+                for cand, score, _ in process.extract(
+                        en, names, scorer=fuzz.token_set_ratio,
+                        score_cutoff=threshold, limit=25):
+                    shared = en_tok & tokens.get(cand, set())
+                    if not shared or (len(shared) < min_shared
+                                      and min(df[t] for t in shared) > rare_df):
+                        continue
                     matched.append(idx)
-                    match_rows.append((st, echo.at[idx, "AIRName"], hit[0],
-                                       round(hit[1], 1), "fuzzy"))
+                    match_rows.append((st, echo.at[idx, "AIRName"], cand,
+                                       round(score, 1), "fuzzy",
+                                       src.get((st, cand), "extracted")))
+                    break
     echo["matched"] = echo.index.isin(set(matched))
     audit = pd.DataFrame(match_rows, columns=["state", "echo_name",
-                                              "union_norm_name", "score", "type"])
+                                              "union_norm_name", "score", "type",
+                                              "name_source"])
     return echo, audit
 
 
@@ -279,14 +336,31 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--union", help="union CSV to benchmark (default: the module's UNION_CSV)")
     ap.add_argument("--refresh-echo", action="store_true")
+    ap.add_argument("--aliases", type=Path,
+                    default=Path("data/processed/analysis/facility_name_aliases.csv"),
+                    help="source-agency facility names per document "
+                         "(build_facility_name_aliases.py); skipped if absent")
+    ap.add_argument("--no-aliases", action="store_true",
+                    help="match on extracted facility names only (pre-alias baseline)")
+    ap.add_argument("--out-dir", type=Path,
+                    help="write the analysis CSVs here instead of "
+                         "data/processed/analysis (for side-by-side runs)")
     ap.add_argument("--threshold", type=float, default=93,
                     help="rapidfuzz token_set_ratio cutoff for fuzzy matches")
+    ap.add_argument("--min-shared-tokens", type=int, default=2,
+                    help="distinctive words a fuzzy match must agree on "
+                         "(0 = pre-2026-08 behaviour, token_set_ratio alone)")
+    ap.add_argument("--rare-token-df", type=int, default=6,
+                    help="one shared word suffices if it appears in at most "
+                         "this many of the state's ECHO facility names")
     ap.add_argument("--cbp-year", type=int, default=2022)
     ap.add_argument("--asm-year", type=int, default=2021,
                     help="ASM vintage (2021 is the latest non-Economic-Census year)")
     args = ap.parse_args()
+    global UNION_CSV, ANALYSIS_DIR
+    if args.out_dir:
+        ANALYSIS_DIR = args.out_dir
     ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
-    global UNION_CSV
     if args.union:
         UNION_CSV = Path(args.union)
     print(f"union: {UNION_CSV}")
@@ -298,13 +372,39 @@ def main():
     docs = files["Facility State Abbreviation"].value_counts()
     union_fac = (u[u["Facility Name"] != ""]
                  .assign(norm=lambda d: d["Facility Name"].map(norm_name),
-                         state=lambda d: d["Facility State Abbreviation"])
+                         state=lambda d: d["Facility State Abbreviation"],
+                         name_source="extracted")
+                 [["state", "norm", "name_source"]]
                  .query("norm != '' and state in @STATES")
                  .drop_duplicates(["state", "norm"]))
+    n_extracted_names = len(union_fac)
+    # legacy continuity: the per-state name-count column stays extracted-only
     fac_counts = union_fac.groupby("state").size()
 
+    if args.no_aliases or not args.aliases.exists():
+        if args.no_aliases:
+            print("aliases: disabled (--no-aliases)")
+        else:
+            print(f"aliases: none at {args.aliases} -- extracted names only")
+    else:
+        al = pd.read_csv(args.aliases, dtype=str, keep_default_na=False)
+        in_union = al[al["filename"].isin(set(u["Filename"]))]
+        al_fac = (in_union.assign(norm=lambda d: d["source_name"].map(norm_name),
+                                  state=lambda d: d["state"].str.upper(),
+                                  name_source="source_index")
+                  [["state", "norm", "name_source"]]
+                  .query("norm != '' and state in @STATES")
+                  .drop_duplicates(["state", "norm"]))
+        union_fac = (pd.concat([union_fac, al_fac], ignore_index=True)
+                     .drop_duplicates(["state", "norm"]))
+        print(f"aliases: {len(in_union):,} rows for "
+              f"{in_union['filename'].nunique():,} union documents "
+              f"({args.aliases}); "
+              f"+{len(union_fac) - n_extracted_names:,} distinct names on the union side")
+
     echo = fetch_echo_majors(refresh=args.refresh_echo)
-    echo, audit = match_union_to_echo(echo, union_fac, args.threshold)
+    echo, audit = match_union_to_echo(echo, union_fac, args.threshold,
+                                      args.min_shared_tokens, args.rare_token_df)
     audit.to_csv(ANALYSIS_DIR / "echo_union_matches.csv", index=False)
 
     n_echo, n_matched = len(echo), int(echo["matched"].sum())
@@ -313,6 +413,12 @@ def main():
           f"({n_matched / n_echo:.1%})")
     print(f"Union distinct facility names (in-state): {len(union_fac):,} "
           f"(unmatched union names include minor sources and name variants)")
+    if "name_source" in audit and (audit["name_source"] == "source_index").any():
+        alias_only = audit[audit["name_source"] == "source_index"]
+        print(f"  of those, {len(alias_only):,} matched only via a source-agency "
+              f"name: " + ", ".join(
+                  f"{st} +{n}" for st, n in
+                  alias_only["state"].value_counts().head(10).items()))
 
     # --- by state (superset of the legacy table) ---
     st = coverage_table(echo, "AIRState").rename(columns={"AIRState": "state"})

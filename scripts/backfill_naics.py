@@ -8,7 +8,10 @@ one resolved code per permit from the best available source, in priority
 order, and records which source won so downstream users can filter on it:
 
   permit   a valid 6-digit NAICS stated in the permit itself
-  echo     EPA ECHO's AIRNAICS for the facility this permit matched
+  echo     EPA ECHO's AIRNAICS for the facility this permit matched -- by the
+           name the permit states, or by the name its source agency's index
+           records for the document (facility_name_aliases.csv), which is how
+           the ECHO match itself is made
   derived  the pipeline's Classified NAICS, excluding the 339999 catch-all
   sic      crosswalked from a permit-stated SIC code (2-digit sector only)
   (blank)  none of the above -> candidate for LLM classification
@@ -36,6 +39,7 @@ csv.field_size_limit(sys.maxsize)
 
 ECHO = Path("data/raw/echo_air_majors/echo_air_majors.csv")
 MATCHES = Path("data/processed/analysis/echo_union_matches.csv")
+ALIASES = Path("data/processed/analysis/facility_name_aliases.csv")
 OUT_DIR = Path("data/processed/analysis")
 
 NAME_SUFFIXES = {"INC", "LLC", "LP", "LTD", "CO", "CORP", "CORPORATION", "COMPANY",
@@ -103,8 +107,20 @@ def main():
         for r in csv.DictReader(MATCHES.open(encoding="utf-8", errors="replace")):
             code = echo_naics.get((r["state"], norm_name(r["echo_name"])))
             if code:
+                # the audit normalises names slightly differently to this
+                # script (it keeps PLANT/FACILITY); key both forms
                 matched[(r["state"], r["union_norm_name"])] = code
+                matched[(r["state"], norm_name(r["union_norm_name"]))] = code
     print(f"union facility names carrying an ECHO NAICS: {len(matched):,}")
+
+    # document -> the name(s) its source agency's index uses; the ECHO match is
+    # often made on one of these rather than on the name the permit prints
+    aliases = defaultdict(list)
+    if ALIASES.exists():
+        for r in csv.DictReader(ALIASES.open(encoding="utf-8", errors="replace")):
+            aliases[r["filename"]].append(
+                ((r["state"] or "").strip().upper(), r["source_name"]))
+    print(f"documents with a source-agency name: {len(aliases):,}")
 
     permits = {}
     with args.union.open(encoding="utf-8", errors="replace", newline="") as f:
@@ -115,6 +131,7 @@ def main():
     print(f"successful permits: {len(permits):,}")
 
     src_counts = Counter()
+    alias_hits = 0
     rows, worklist = [], []
     for fn, r in permits.items():
         state = (r.get("Facility State Abbreviation") or "").strip().upper()
@@ -124,6 +141,12 @@ def main():
         if not code:
             code = matched.get((state, norm_name(fac)))
             source = "echo" if code else None
+        if not code:
+            for al_state, al_name in aliases.get(fn, ()):
+                code = matched.get((al_state, norm_name(al_name)))
+                if code:
+                    source, alias_hits = "echo", alias_hits + 1
+                    break
         if not code:
             c = first_valid_naics(r.get("Classified NAICS"))
             if c and c not in JUNK_CODES:
@@ -156,6 +179,8 @@ def main():
         w.writerows(worklist)
 
     tot = len(rows)
+    print(f"\nof the ECHO-sourced codes, {alias_hits:,} were reached via a "
+          f"source-agency name rather than the name the permit prints")
     print("\nresolution by source:")
     for s, c in src_counts.most_common():
         print(f"  {s:<12} {c:>7,} ({c/tot:.1%})")

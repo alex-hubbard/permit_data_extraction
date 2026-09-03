@@ -11,10 +11,14 @@ on it before -- and writes a copy with the two columns inserted after
 `Classified NAICS`. Permits absent from the resolution (those whose status is
 not "Success", which the backfill skips) get empty values in both columns.
 
+Re-running the NAICS backfill produces new codes for a union that already
+carries the columns (v5b onward); pass --refresh to rewrite the values in
+place instead of inserting the columns.
+
 Usage:
     PYTHONPATH=. python scripts/add_resolved_naics_to_union.py \
         [--union data/processed/permit_data_union_v5a.csv] \
-        [--out   data/processed/permit_data_union_v5b.csv]
+        [--out   data/processed/permit_data_union_v5b.csv] [--refresh]
 """
 import argparse
 import csv
@@ -36,6 +40,9 @@ def main():
     ap.add_argument("--out", type=Path,
                     default=Path("data/processed/permit_data_union_v5b.csv"))
     ap.add_argument("--resolved", type=Path, default=RESOLVED)
+    ap.add_argument("--refresh", action="store_true",
+                    help="union already has the columns: rewrite their values "
+                         "in place (a NAICS re-run) rather than inserting")
     args = ap.parse_args()
 
     codes = {}
@@ -51,11 +58,18 @@ def main():
             args.out.open("w", encoding="utf-8", newline="") as fout:
         reader = csv.DictReader(fin)
         cols = list(reader.fieldnames)
-        for c in NEW_COLS:
-            if c in cols:
-                raise SystemExit(f"{args.union} already has a {c!r} column")
-        at = cols.index(ANCHOR) + 1
-        cols[at:at] = NEW_COLS
+        present = [c for c in NEW_COLS if c in cols]
+        if present and not args.refresh:
+            raise SystemExit(f"{args.union} already has {present} -- pass "
+                             f"--refresh to rewrite the values in place")
+        if args.refresh and len(present) != len(NEW_COLS):
+            raise SystemExit(f"--refresh needs both {NEW_COLS} present; "
+                             f"{args.union} has {present}")
+        if present:
+            print(f"refreshing {NEW_COLS} in place")
+        else:
+            at = cols.index(ANCHOR) + 1
+            cols[at:at] = NEW_COLS
         writer = csv.DictWriter(fout, fieldnames=cols)
         writer.writeheader()
 
