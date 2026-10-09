@@ -15,6 +15,23 @@ REGION="us-central1"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
+# Refuse to ship a raw union parquet. The app only dictionary-reads string
+# columns (and skips its per-row derivation passes) when the file already
+# carries the derived columns from build_dashboard_ready_parquet.py; a raw
+# file takes the legacy path, decodes every string to Python objects and
+# OOMs the 4 GiB container in a restart loop (2026-09-03 v5f deploy).
+PYTHONPATH=dashboards python - <<'PY'
+import sys
+import pyarrow.parquet as pq
+import manufacturing_subsector as dash
+names = set(pq.ParquetFile("data/processed/dashboard/permits.parquet").schema_arrow.names)
+missing = sorted(dash._DERIVED_COLUMNS - names)
+if missing:
+    sys.exit(f"permits.parquet is not dashboard-ready (missing {missing}); "
+             "run scripts/build_dashboard_ready_parquet.py first")
+print(f"permits.parquet is dashboard-ready ({len(names)} columns)")
+PY
+
 mkdir -p "$STAGE/dashboards" "$STAGE/data/processed/dashboard" "$STAGE/.streamlit"
 cp dashboards/manufacturing_subsector.py "$STAGE/dashboards/"
 cp data/processed/dashboard/permits.parquet "$STAGE/data/processed/dashboard/"

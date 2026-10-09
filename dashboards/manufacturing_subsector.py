@@ -728,7 +728,15 @@ def view_aggregates(code: str, states: tuple, data_path_str: str) -> dict:
         .reset_index(drop=True)
     )
 
-    out["top_unit_type"] = _top_counts(sub[_pref(sub, "Unit Type")], 15)
+    # Equipment Category is the 16-way rollup of the free-text Unit Type
+    # (scripts/classify_unit_types.py); show every category rather than a
+    # top-N. Older parquets without the column fall back to raw unit types.
+    if "Equipment Category" in sub.columns:
+        out["top_equipment"] = _top_counts(sub["Equipment Category"], 20)
+        out["equipment_label"] = "Equipment category"
+    else:
+        out["top_equipment"] = _top_counts(sub[_pref(sub, "Unit Type")], 15)
+        out["equipment_label"] = "Unit type"
     out["top_fuel"] = _top_counts(sub[_pref(sub, "Fuel Type")], 15)
     out["top_control"] = _top_counts(sub[_pref(sub, "Control Device(s)")], 15)
     out["top_industry"] = _top_counts(sub[_pref(sub, "Industry Description")], 15)
@@ -950,7 +958,10 @@ def _top_counts(series: pd.Series, n: int) -> pd.DataFrame:
     vc = vc[vc > 0]
     if vc.empty:
         return pd.DataFrame(columns=["value", "count"])
-    labels = vc.index.astype(str).str.strip()
+    # astype(object), not astype(str): on a CategoricalIndex the latter
+    # builds a fixed-width numpy unicode array sized to the longest label
+    # (126K control-device labels x a multi-KB outlier = 1.8 GB, 3 s).
+    labels = vc.index.astype(object).map(lambda v: str(v).strip())
     vc = pd.Series(vc.values, index=labels)
     vc = vc[vc.index != ""]
     if vc.empty:
@@ -1043,7 +1054,8 @@ _EXPORT_EXCLUDE = frozenset(
 _LEAD_COLUMNS = [
     "Facility Name", "Facility City", "Facility State Abbreviation",
     "NAICS_clean", "NAICS Source", "Industry Description",
-    "Unit ID", "Unit Description", "Unit Type", "Unit Make", "Unit Model",
+    "Unit ID", "Unit Description", "Unit Type", "Equipment Category",
+    "Equipment Subcategory", "Combustion Source", "Unit Make", "Unit Model",
     "Year of Manufacture", "Capacity Value", "Capacity Unit", "Fuel Type",
     "Pollutants", "Emission Limits", "Control Device(s)",
     "Permit Number", "Issuance Date", "Expiration Date",
@@ -1070,16 +1082,80 @@ def render_data_table(table_head: pd.DataFrame, total_rows: int, n_cols: int) ->
 CSV_MAX_ROWS = 250_000
 
 
+# Pre-built download files live in a public GCS bucket (see
+# scripts/publish_release_to_gcs.py). Building them inside the Cloud Run
+# container OOMed the 4 GiB instance on large selections (2026-10-09) and any
+# single response is capped at 32 MB there; storage.googleapis.com has neither
+# limit. Only small selections are still exported on demand.
+PUBLIC_RELEASE_VERSION = "v5f"
+PUBLIC_RELEASE_BASE = (
+    f"https://storage.googleapis.com/permit-data-extraction-public/{PUBLIC_RELEASE_VERSION}"
+)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _remote_size_mb(url: str) -> float | None:
+    """Content-Length of a public object (MB) via HEAD; None if unavailable."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            size = resp.headers.get("Content-Length")
+            return int(size) / 1e6 if size else None
+    except Exception:
+        return None
+
+
+def _release_link(label: str, url: str) -> bool:
+    """Link button for a published file; nothing is drawn if it is missing."""
+    size = _remote_size_mb(url)
+    if size is None:
+        return False
+    st.link_button(f"{label} ({size:,.0f} MB)", url, use_container_width=True)
+    return True
+
+
 def render_downloads(code: str, state_filter: list[str], data_path_str: str,
                      n: int, cols: list[str]) -> None:
-    st.markdown("### Download this selection")
+    st.markdown("### Download")
+    base = PUBLIC_RELEASE_BASE
+    ver = PUBLIC_RELEASE_VERSION
+    c1, c2, c3 = st.columns(3)
+    shown = 0
+    with c1:
+        shown += _release_link("Full dataset — Parquet", f"{base}/permit_units_{ver}_full.parquet")
+    with c2:
+        shown += _release_link("Full dataset — CSV (gzip)", f"{base}/permit_units_{ver}_full.csv.gz")
+    with c3:
+        if code != ALL_CODE:
+            shown += _release_link(f"{option_display_name(code)} — Parquet",
+                                   f"{base}/subsets/permit_units_{ver}_{code}.parquet")
+    if shown:
+        st.caption(
+            "Files are served straight from Google Cloud Storage, so there is no "
+            "size limit. Subsector files carry the dashboard's export columns; the "
+            "full-dataset files carry the release schema."
+            + (" Subsector files are not split by state; for a state-filtered "
+               "extract use the on-demand export below." if state_filter else "")
+        )
+    else:
+        st.caption("Pre-built download files are not reachable right now.")
+
+    if n > CSV_MAX_ROWS:
+        st.caption(
+            f"On-demand export is available for selections up to {CSV_MAX_ROWS:,} "
+            f"rows; this selection has {n:,}. Use the files above, or narrow the "
+            "selection with a subsector or state filter."
+        )
+        return
+
     slug = "permit_units_" + (code.lower() if code else "all")
     if state_filter:
         slug += "_" + "-".join(s.lower() for s in sorted(state_filter)[:5])
 
     prepare = st.checkbox(
-        f"Prepare download files ({n:,} rows × {len(cols)} columns)",
-        help="Files are generated on demand so browsing stays fast.",
+        f"Prepare an on-demand export of this selection ({n:,} rows × {len(cols)} columns)",
+        help="Built on demand for small selections; large ones use the files above.",
     )
     if not prepare:
         return
@@ -1215,8 +1291,9 @@ def main() -> None:
 
     left, right = st.columns(2)
     with left:
-        st.markdown("### Top unit types")
-        chart_top_categorical(view["top_unit_type"], "Unit type")
+        st.markdown("### Equipment categories"
+                    if view["equipment_label"] == "Equipment category" else "### Top unit types")
+        chart_top_categorical(view["top_equipment"], view["equipment_label"])
     with right:
         st.markdown("### Top fuel types")
         chart_top_categorical(view["top_fuel"], "Fuel type")
