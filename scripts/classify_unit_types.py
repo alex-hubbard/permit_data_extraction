@@ -13,7 +13,7 @@ carries ~62,000 distinct normalised strings ("boiler", "boiler/process heater",
   * ``Equipment Category``     16 coarse categories plus "Unspecified / generic"
         (boilers and process heaters are deliberately separate: different EIS
         codes, different standards, different decarbonisation pathways)
-  * ``Combustion Source``      combustion / non-combustion / unknown
+  * ``Equipment Designation``  combustion / non-combustion / unknown (named Combustion Source before 2026-10-23, Equipment Type until 2026-10-26)
   * ``Equipment Category Basis`` which field decided it: unit_type,
         unit_description, capacity_unit, or none
 
@@ -64,7 +64,7 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
-OUT_COLS = ["Equipment Category", "Equipment Subcategory", "Combustion Source", "Equipment Category Basis"]
+OUT_COLS = ["Equipment Category", "Equipment Subcategory", "Equipment Designation", "Equipment Category Basis"]
 
 # --------------------------------------------------------------------------- #
 # Taxonomy: fine -> (coarse, EIS unit-type code, default combustion flag)
@@ -545,7 +545,7 @@ def classify_frame(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({
         "Equipment Category": coarse.astype("category"),
         "Equipment Subcategory": fine.astype("category"),
-        "Combustion Source": flag.astype("category"),
+        "Equipment Designation": flag.astype("category"),
         "Equipment Category Basis": source.astype("category"),
     }, index=df.index)
 
@@ -592,10 +592,10 @@ def main() -> None:
     cov_f["share"] = (cov_f.rows / n).round(4)
     cov_f["eis_code"] = cov_f["Equipment Subcategory"].map(FINE_TO_EIS).astype("Int64")
     cov_f.to_csv(out / "coverage_fine.csv", index=False)
-    comb = pd.crosstab(cat["Equipment Category"], cat["Combustion Source"])
+    comb = pd.crosstab(cat["Equipment Category"], cat["Equipment Designation"])
     comb.to_csv(out / "combustion_by_coarse.csv")
     print("\n== coarse coverage ==\n" + cov_c.to_string())
-    print("\n== combustion flag ==\n" + cat["Combustion Source"].value_counts().to_string())
+    print("\n== combustion flag ==\n" + cat["Equipment Designation"].value_counts().to_string())
     print("\n== combustion by coarse ==\n" + comb.to_string())
     print("\n== match basis ==\n" + cat["Equipment Category Basis"].value_counts().to_string())
 

@@ -44,11 +44,18 @@ for p in (str(REPO), str(REPO / "dashboards")):
 import manufacturing_subsector as dash  # noqa: E402
 
 BUCKET = "permit-data-extraction-public"
-VERSION = "v5f"
+VERSION = "v5g"
 READY_PARQUET = REPO / "data/processed/dashboard/permits.parquet"
-FULL_PARQUET = REPO / "data/processed/dashboard/permits_v5f.parquet"
-UNION_CSV = REPO / "data/processed/permit_data_union_v5f.csv"
-STAGE = REPO / "data/processed/dashboard/public_release"
+# de-identified release (scripts/deidentify_release.py); the bucket is public,
+# so nothing with facility names, addresses, permit numbers or filenames goes here
+RELEASE_DIR = REPO / "data/processed/release/v5g_deid"
+FULL_PARQUET = RELEASE_DIR / "permit_equipment_full.parquet"
+UNION_CSV = RELEASE_DIR / "permit_equipment_full.csv.gz"
+RELEASE_EXTRAS = ["permit_equipment_manufacturing.csv.gz", "data_dictionary.csv"]
+STAGE = REPO / f"data/processed/release/public_{VERSION}"
+IDENTIFYING = {"Facility Name", "Facility Address", "Facility City", "Facility Zip Code",
+               "Permit Number", "Filename", "Latest Facility Filename", "Owner/Operator Name",
+               "Owner/Operator Name (if different from Facility Name)"}
 BATCH = 100_000
 
 
@@ -140,11 +147,19 @@ def build(stage: Path) -> None:
     shutil.copyfile(FULL_PARQUET, full)
     items.append({"path": full.name, "code": "ALL", "rows": pq.ParquetFile(full).metadata.num_rows,
                   "bytes": full.stat().st_size, "format": "parquet"})
+    leaked = IDENTIFYING & (set(pq.ParquetFile(FULL_PARQUET).schema_arrow.names)
+                            | set(pq.ParquetFile(READY_PARQUET).schema_arrow.names))
+    if leaked:
+        sys.exit(f"refusing to publish identifying columns: {sorted(leaked)}")
     gz = stage / f"permit_units_{VERSION}_full.csv.gz"
-    print(f"gzip {UNION_CSV.name} -> {gz.name} ...", flush=True)
-    with gz.open("wb") as out:
-        subprocess.run(["gzip", "-c", "-6", str(UNION_CSV)], stdout=out, check=True)
-    items.append({"path": gz.name, "code": "ALL", "rows": None, "bytes": gz.stat().st_size, "format": "csv.gz"})
+    shutil.copyfile(UNION_CSV, gz)
+    items.append({"path": gz.name, "code": "ALL", "rows": items[0]["rows"], "bytes": gz.stat().st_size,
+                  "format": "csv.gz"})
+    for name in RELEASE_EXTRAS:
+        shutil.copyfile(RELEASE_DIR / name, stage / name)
+        items.append({"path": name, "code": "MFG" if "manufacturing" in name else "-",
+                      "rows": None, "bytes": (stage / name).stat().st_size,
+                      "format": name.split(".", 1)[1]})
     for it in build_subsets(stage):
         it["format"] = "parquet"
         items.append(it)
@@ -153,12 +168,16 @@ def build(stage: Path) -> None:
     (stage / "manifest.json").write_text(json.dumps(manifest, indent=2))
     (stage / "README.txt").write_text(
         f"Air permit emission-unit dataset, release {VERSION}\n\n"
-        "permit_units_*_full.parquet : every extracted emission unit, original columns\n"
-        "permit_units_*_full.csv.gz  : the same table as gzip-compressed CSV (UTF-8, CRLF)\n"
+        "Facility names, owners, addresses, cities, ZIP codes, permit numbers and source\n"
+        "filenames are removed; county, state and industry codes remain. Document ID and\n"
+        "Facility ID are opaque keys. See data_dictionary.csv for every column.\n\n"
+        "permit_units_*_full.parquet : every processed permit, release columns\n"
+        "permit_units_*_full.csv.gz  : the same table as gzip-compressed CSV (UTF-8)\n"
+        "permit_equipment_manufacturing.csv.gz : manufacturing subset (NAICS 31-33)\n"
         "subsets/                    : one Parquet per dashboard subsector option, with the\n"
         "                              dashboard's export columns (adds NAICS_clean, Subsector,\n"
         "                              normalised capacity/fuel/unit-type fields)\n"
-        "Equipment Category / Equipment Subcategory / Combustion Source are rule-based rollups of\n"
+        "Equipment Category / Equipment Subcategory / Equipment Designation are rule-based rollups of\n"
         "the free-text Unit Type (scripts/classify_unit_types.py in the project repository).\n")
     for it in items:
         print(f"  {it['path']:<55} {it['bytes'] / 1e6:8.1f} MB  rows={it['rows']}")

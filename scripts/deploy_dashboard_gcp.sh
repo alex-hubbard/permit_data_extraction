@@ -29,13 +29,19 @@ missing = sorted(dash._DERIVED_COLUMNS - names)
 if missing:
     sys.exit(f"permits.parquet is not dashboard-ready (missing {missing}); "
              "run scripts/build_dashboard_ready_parquet.py first")
-print(f"permits.parquet is dashboard-ready ({len(names)} columns)")
+ident = sorted(names & {"Facility Name", "Facility Address", "Facility City", "Facility Zip Code",
+                        "Permit Number", "Filename", "Latest Facility Filename",
+                        "Owner/Operator Name (if different from Facility Name)"})
+if ident:
+    sys.exit(f"permits.parquet still carries identifying columns {ident}; "
+             "run scripts/deidentify_release.py --dashboard-in/--dashboard-out first")
+print(f"permits.parquet is dashboard-ready and de-identified ({len(names)} columns)")
 PY
 
 mkdir -p "$STAGE/dashboards" "$STAGE/data/processed/dashboard" "$STAGE/.streamlit"
 cp dashboards/manufacturing_subsector.py "$STAGE/dashboards/"
 cp data/processed/dashboard/permits.parquet "$STAGE/data/processed/dashboard/"
-cp data/processed/dashboard/city_centroids.parquet "$STAGE/data/processed/dashboard/"
+cp data/processed/dashboard/county_centroids.parquet "$STAGE/data/processed/dashboard/"
 
 cat > "$STAGE/requirements.txt" <<'EOF'
 streamlit==1.43.0

@@ -20,9 +20,9 @@ DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "processed" / "permit_data_extracted
 FRS_FACILITIES_PATH = PROJECT_ROOT / "data" / "external" / "FRS_FACILITIES.csv"
 DASHBOARD_PARQUET_DIR = PROJECT_ROOT / "data" / "processed" / "dashboard"
 PERMITS_PARQUET = DASHBOARD_PARQUET_DIR / "permits.parquet"
-CENTROIDS_PARQUET = DASHBOARD_PARQUET_DIR / "city_centroids.parquet"
+CENTROIDS_PARQUET = DASHBOARD_PARQUET_DIR / "county_centroids.parquet"
 PERMITS_FILENAME = "permits.parquet"
-CENTROIDS_FILENAME = "city_centroids.parquet"
+CENTROIDS_FILENAME = "county_centroids.parquet"
 
 # Optional remote artifact location. When set, the dashboard reads parquet
 # from there instead of the local copy. Two URI schemes are supported:
@@ -393,17 +393,37 @@ def _digits_only(value: object) -> str | None:
     return s or None
 
 
+_COUNTY_SUFFIX_RX = re.compile(r"\s+(COUNTY|PARISH|BOROUGH|CENSUS AREA|MUNICIPALITY|CO)$")
+
+
+def norm_county(value: object) -> str:
+    """Join key for a county name: 'St. Charles Parish' and FRS 'ST CHARLES'
+    both become 'ST CHARLES'. Shared by the release builder and the FRS
+    centroid table so the two sides of the map join cannot drift."""
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return ""
+    s = " ".join(re.sub(r"[^A-Z0-9 ]+", " ", str(value).upper().replace("'", "")).split())
+    if s in ("NONE", "NAN", "N A", "NA", "UNKNOWN"):
+        return ""
+    s = re.sub(r"^SAINTE\b", "STE", re.sub(r"^SAINT\b", "ST", s))
+    prev = None
+    while prev != s:
+        prev, s = s, _COUNTY_SUFFIX_RX.sub("", s)
+    return s
+
+
 # cache_resource, not cache_data: cache_data hands every caller a fresh
 # pickled COPY of the return value, which at 1.1M rows costs seconds per
 # widget interaction. The cached frames are treated as read-only.
-@st.cache_resource(show_spinner="Loading FRS city centroids…")
-def load_city_centroids(csv_path: Path, parquet_path: Path = CENTROIDS_PARQUET) -> pd.DataFrame:
-    """Median lat/lon per (state, city) from EPA FRS, used to plot facility points.
+@st.cache_resource(show_spinner="Loading FRS county centroids…")
+def load_county_centroids(csv_path: Path, parquet_path: Path = CENTROIDS_PARQUET) -> pd.DataFrame:
+    """Median lat/lon per (state, county) from EPA FRS, used to plot facility points.
 
-    Source preference:
-      1. ``PERMIT_DASHBOARD_S3_URI/city_centroids.parquet`` (if env var set)
-      2. local prebuilt parquet (~1 MB)
-      3. raw 336 MB FRS CSV (slow fallback)
+    The public release carries no facility address or city, so the map works
+    at county level. Source preference:
+      1. ``PERMIT_DASHBOARD_S3_URI/county_centroids.parquet`` (if env var set)
+      2. local prebuilt parquet
+      3. raw 336 MB FRS CSV (slow fallback; also how the parquet is built)
     """
     remote_uri = _s3_uri_for(CENTROIDS_FILENAME)
     if remote_uri is not None:
@@ -411,24 +431,25 @@ def load_city_centroids(csv_path: Path, parquet_path: Path = CENTROIDS_PARQUET) 
     if parquet_path.exists():
         return pd.read_parquet(parquet_path)
     if not csv_path.exists():
-        return pd.DataFrame(columns=["key_state", "key_city", "Lat", "Lon"])
+        return pd.DataFrame(columns=["key_state", "key_county", "Lat", "Lon"])
     frs = pd.read_csv(
         csv_path,
         dtype=str,
-        usecols=["FAC_CITY", "FAC_STATE", "LATITUDE_MEASURE", "LONGITUDE_MEASURE"],
+        usecols=["FAC_COUNTY", "FAC_STATE", "LATITUDE_MEASURE", "LONGITUDE_MEASURE"],
     )
     frs["Lat"] = pd.to_numeric(frs["LATITUDE_MEASURE"], errors="coerce")
     frs["Lon"] = pd.to_numeric(frs["LONGITUDE_MEASURE"], errors="coerce")
-    frs = frs.dropna(subset=["Lat", "Lon", "FAC_CITY", "FAC_STATE"])
+    frs = frs.dropna(subset=["Lat", "Lon", "FAC_COUNTY", "FAC_STATE"])
     frs = frs[
         frs["Lat"].between(17, 72)
         & frs["Lon"].between(-180, -65)
         & (frs["Lat"] != 0)
     ]
     frs["key_state"] = frs["FAC_STATE"].str.upper().str.strip()
-    frs["key_city"] = frs["FAC_CITY"].str.upper().str.strip()
+    frs["key_county"] = frs["FAC_COUNTY"].map(norm_county)
+    frs = frs[frs["key_county"] != ""]
     centroids = (
-        frs.groupby(["key_state", "key_city"])[["Lat", "Lon"]].median().reset_index()
+        frs.groupby(["key_state", "key_county"])[["Lat", "Lon"]].median().reset_index()
     )
     return centroids
 
@@ -440,7 +461,7 @@ def load_city_centroids(csv_path: Path, parquet_path: Path = CENTROIDS_PARQUET) 
 _DERIVED_COLUMNS = frozenset(
     ["NAICS_clean", "Subsector", "Site Key", "Capacity Value (num)",
      "Capacity Unit (norm)", "Fuel Type (norm)", "Unit Quantity (num)",
-     "key_state", "key_city"]
+     "key_state", "key_county"]
     + [f"is_{code}" for code in KEYWORD_FILTERS]
 )
 
@@ -481,8 +502,12 @@ def load_data(
     # carries every derived column and the centroid join. Recomputing them here
     # exhausts Streamlit's memory budget at current row counts, so short-circuit.
     if _DERIVED_COLUMNS.issubset(df.columns):
-        centroids = load_city_centroids(centroids_path)
-        return df.merge(centroids, on=["key_state", "key_city"], how="left")
+        centroids = load_county_centroids(centroids_path)
+        # the combustion flag was Combustion Source, then Equipment Type (10-23), now Equipment Designation (10-26)
+        df = df.rename(columns={"Combustion Source": "Equipment Designation",
+                                "Equipment Type": "Equipment Designation",
+                                "Combustion Class": "Equipment Designation"})
+        return df.merge(centroids, on=["key_state", "key_county"], how="left")
 
     # Pick the most reliable NAICS: prefer Classified NAICS (full 6-digit),
     # fall back to the raw NAICS Code from the permit. The "Other NAICS" sheet
@@ -533,11 +558,11 @@ def load_data(
         df["Unit Type (norm)"] = df["Unit Type"].apply(
             lambda v: _normalize_freetext(v, UNIT_TYPE_SYNONYMS))
 
-    # Attach city-centroid coordinates for points-on-map view.
-    centroids = load_city_centroids(centroids_path)
+    # Attach county-centroid coordinates for points-on-map view.
+    centroids = load_county_centroids(centroids_path)
     df["key_state"] = df["Facility State Abbreviation"].str.upper().str.strip()
-    df["key_city"] = df["Facility City"].str.upper().str.strip()
-    df = df.merge(centroids, on=["key_state", "key_city"], how="left")
+    df["key_county"] = df["Facility County"].map(norm_county)
+    df = df.merge(centroids, on=["key_state", "key_county"], how="left")
 
     return df
 
@@ -702,8 +727,7 @@ def view_aggregates(code: str, states: tuple, data_path_str: str) -> dict:
         "units": len(sub),
         "states": int(sub["Facility State Abbreviation"].nunique()),
         "median_units": float(ups.median()) if len(ups) else 0.0,
-        "permits": int(sub["Permit Number"].nunique()) if "Permit Number" in sub.columns else 0,
-        "documents": int(sub["Filename"].nunique()) if "Filename" in sub.columns else 0,
+        "documents": int(sub["Document ID"].nunique()) if "Document ID" in sub.columns else 0,
     }
     out["ups"] = ups.rename("units").reset_index()
 
@@ -719,13 +743,13 @@ def view_aggregates(code: str, states: tuple, data_path_str: str) -> dict:
 
     out["sites"] = (
         sub.groupby("Site Key", observed=True)
-        .agg(facility=("Facility Name", "first"),
-             city=("Facility City", "first"),
+        .agg(county=("Facility County", "first"),
              state=("Facility State Abbreviation", "first"),
              units=("Site Key", "size"),
              lat=("Lat", "first"),
              lon=("Lon", "first"))
-        .reset_index(drop=True)
+        .reset_index()
+        .rename(columns={"Site Key": "site"})
     )
 
     # Equipment Category is the 16-way rollup of the free-text Unit Type
@@ -788,13 +812,12 @@ def option_display_name(code: str) -> str:
 
 
 def kpi_row(k: dict) -> None:
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Facilities (sites)", f"{k['facilities']:,}")
-    c2.metric("Permits", f"{k['permits']:,}")
-    c3.metric("Permit documents", f"{k['documents']:,}")
-    c4.metric("Emission units", f"{k['units']:,}")
-    c5.metric("States represented", f"{k['states']}")
-    c6.metric("Median units / site", f"{k['median_units']:.0f}")
+    c2.metric("Permit documents", f"{k['documents']:,}")
+    c3.metric("Emission units", f"{k['units']:,}")
+    c4.metric("States represented", f"{k['states']}")
+    c5.metric("Median units / site", f"{k['median_units']:.0f}")
 
 
 def _primary_bucket(sub: pd.DataFrame) -> pd.Series:
@@ -843,74 +866,58 @@ MAX_MAP_POINTS = 8000
 
 
 def chart_state_distribution(sites: pd.DataFrame, uniform_markers: bool = False) -> None:
-    plotted = sites.dropna(subset=["lat", "lon"])
-    capped = len(plotted) > MAX_MAP_POINTS
+    # The public release has no facility address or city, so sites are
+    # placed at their county's FRS centroid and drawn one point per county.
+    located = sites.dropna(subset=["lat", "lon"])
+    counties = (
+        located.groupby(["state", "county", "lat", "lon"], observed=True, dropna=False)
+        .agg(facilities=("site", "nunique"), units=("units", "sum"))
+        .reset_index()
+    )
+    counties["place"] = counties["county"].fillna("").astype(str) + ", " + counties["state"].astype(str)
+    capped = len(counties) > MAX_MAP_POINTS
     if capped:
         # Browser-side rendering chokes on tens of thousands of markers;
-        # keep the largest sites, which carry the visual story anyway.
-        plotted = plotted.nlargest(MAX_MAP_POINTS, "units")
+        # keep the largest counties, which carry the visual story anyway.
+        counties = counties.nlargest(MAX_MAP_POINTS, "units")
 
     map_col, bar_col = st.columns([1.4, 1])
     with map_col:
-        if plotted.empty:
-            st.info("No facilities resolved to coordinates for this subsector.")
+        if counties.empty:
+            st.info("No facilities resolved to a county location for this subsector.")
         else:
+            hover = {"facilities": True, "units": True, "lat": False, "lon": False}
             if uniform_markers:
                 fig_map = px.scatter_geo(
-                    plotted,
-                    lat="lat",
-                    lon="lon",
-                    scope="usa",
-                    hover_name="facility",
-                    hover_data={
-                        "city": True,
-                        "state": True,
-                        "units": True,
-                        "lat": False,
-                        "lon": False,
-                    },
-                    opacity=0.55,
+                    counties, lat="lat", lon="lon", scope="usa",
+                    hover_name="place", hover_data=hover, opacity=0.55,
                 )
                 fig_map.update_traces(
                     marker=dict(size=4, color="#1f77b4", line=dict(width=0))
                 )
             else:
                 fig_map = px.scatter_geo(
-                    plotted,
-                    lat="lat",
-                    lon="lon",
-                    scope="usa",
-                    size="units",
-                    size_max=22,
-                    color="units",
+                    counties, lat="lat", lon="lon", scope="usa",
+                    size="units", size_max=22, color="units",
                     color_continuous_scale="Viridis",
-                    hover_name="facility",
-                    hover_data={
-                        "city": True,
-                        "state": True,
-                        "units": True,
-                        "lat": False,
-                        "lon": False,
-                    },
-                    opacity=0.7,
+                    hover_name="place", hover_data=hover, opacity=0.7,
                 )
                 fig_map.update_traces(marker=dict(line=dict(width=0)))
             fig_map.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=420)
             st.plotly_chart(fig_map, use_container_width=True)
-            missing = len(sites) - len(plotted)
-            base_caption = (
-                f"{len(plotted):,} of {len(sites):,} sites plotted"
-                + (f" — showing the {MAX_MAP_POINTS:,} largest sites" if capped else "")
-                + (f" — {missing:,} not geocoded or below the size cutoff" if missing else "")
-                + ". Points are FRS city centroids; co-located facilities overlap."
+            missing = len(sites) - len(located)
+            st.caption(
+                f"{len(located):,} of {len(sites):,} sites placed in {len(counties):,} counties"
+                + (f" — showing the {MAX_MAP_POINTS:,} largest counties" if capped else "")
+                + (f" — {missing:,} sites have no usable county" if missing else "")
+                + ". Points are FRS county centroids; facility locations are not published."
             )
-            st.caption(base_caption)
 
     with bar_col:
         by_state = (
             sites.dropna(subset=["state"])
             .groupby("state", observed=True)
-            .agg(facilities=("facility", "nunique"), units=("units", "sum"))
+            .agg(facilities=("site", "nunique"), units=("units", "sum"))
             .reset_index()
             .sort_values("facilities", ascending=False)
         )
@@ -1045,21 +1052,21 @@ def chart_capacity_distribution(cap_stats: pd.DataFrame) -> None:
 
 # Internal plumbing columns kept out of the table and the export files.
 _EXPORT_EXCLUDE = frozenset(
-    ["Lat", "Lon", "key_state", "key_city", "Site Key"]
+    ["Lat", "Lon", "key_state", "key_county", "Site Key"]
     + [f"is_{code}" for code in KEYWORD_FILTERS]
 )
 
 # Reader-friendly ordering for the front of the table; every remaining source
 # column follows in file order so the full schema is always visible.
 _LEAD_COLUMNS = [
-    "Facility Name", "Facility City", "Facility State Abbreviation",
+    "Facility ID", "Facility County", "Facility State Abbreviation",
     "NAICS_clean", "NAICS Source", "Industry Description",
-    "Unit ID", "Unit Description", "Unit Type", "Equipment Category",
-    "Equipment Subcategory", "Combustion Source", "Unit Make", "Unit Model",
+    "Equipment Designation", "Unit ID", "Unit Description", "Unit Type",
+    "Equipment Category", "Equipment Subcategory", "Unit Make", "Unit Model",
     "Year of Manufacture", "Capacity Value", "Capacity Unit", "Fuel Type",
     "Pollutants", "Emission Limits", "Control Device(s)",
-    "Permit Number", "Issuance Date", "Expiration Date",
-    "Regulatory Authority", "Filename",
+    "Issuance Date", "Expiration Date",
+    "Regulatory Authority", "Document ID",
 ]
 
 
@@ -1087,7 +1094,7 @@ CSV_MAX_ROWS = 250_000
 # container OOMed the 4 GiB instance on large selections (2026-10-09) and any
 # single response is capped at 32 MB there; storage.googleapis.com has neither
 # limit. Only small selections are still exported on demand.
-PUBLIC_RELEASE_VERSION = "v5f"
+PUBLIC_RELEASE_VERSION = "v5g"
 PUBLIC_RELEASE_BASE = (
     f"https://storage.googleapis.com/permit-data-extraction-public/{PUBLIC_RELEASE_VERSION}"
 )

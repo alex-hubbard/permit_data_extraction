@@ -6,7 +6,7 @@ scripts/classify_unit_types.classify_frame on each row group / chunk, so the
 new columns are a pure function of each file's own Unit Type, Unit Description,
 Capacity Unit and Fuel Type fields.  Columns added, at the end:
 
-    Equipment Category, Equipment Subcategory, Combustion Source,
+    Equipment Category, Equipment Subcategory, Equipment Designation,
     Equipment Category Basis
 
 Existing columns and row order are untouched.  Output goes to a .tmp path and
