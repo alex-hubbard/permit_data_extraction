@@ -72,6 +72,15 @@ This project provides a pipeline for downloading, processing, and extracting str
    # Edit .env with your API keys
    ```
 
+5. **Install the system tools for OCR (optional):** scanned PDFs fall back to OCR, which
+   needs [Poppler](https://poppler.freedesktop.org/) and
+   [Tesseract](https://github.com/tesseract-ocr/tesseract) on the path, plus the Python
+   packages `pytesseract`, `pdf2image` and `Pillow`.
+   ```bash
+   sudo apt-get install poppler-utils tesseract-ocr
+   pip install pytesseract pdf2image Pillow
+   ```
+
 ## Usage
 
 ### Download EPA permits
@@ -90,6 +99,19 @@ python download_epa_permits.py --resume 100
 ```bash
 python run_extraction_pipeline.py
 ```
+
+### Post-processing, release tables and paper outputs
+The scripts under `scripts/` cover the later stages (each script's header describes its inputs and options):
+
+| Script | Purpose |
+|---|---|
+| `classify_unit_types.py`, `add_equipment_columns.py` | Equipment category, subcategory and designation columns |
+| `deidentify_release.py`, `write_release_readme.py` | De-identified release tables, data dictionary, manifest and README |
+| `manuscript_mfg_subset_stats.py`, `manuscript_mfg_benchmark.py` | Manufacturing-subset statistics and the ECHO / Census benchmark in the paper |
+| `make_manuscript_figures.py`, `make_echo_coverage_map.py` | Paper figures |
+| `run_automated_qc.py` | Automated quality checks |
+
+The files for the document-grounded audit are in `validation/manual_audit/`.
 
 ### Run tests
 ```bash
