@@ -46,20 +46,24 @@ def load_coverage(path: Path = COVERAGE_CSV) -> pd.DataFrame:
     return cov
 
 
-def build_map(cov: pd.DataFrame, title: bool = True) -> go.Figure:
+def build_map(cov: pd.DataFrame, title: bool = True,
+              population: str = "facilities") -> go.Figure:
     national_m = int(cov["matched_facilities"].sum())
     national_t = int(cov["echo_active_major_facilities"].sum())
+    pr = cov[cov["state"] == "PR"]
+    pr_m = int(pr["matched_facilities"].sum()) if len(pr) else 0
+    pr_t = int(pr["echo_active_major_facilities"].sum()) if len(pr) else 0
 
     fig = go.Figure(go.Choropleth(
         locations=cov["state"], locationmode="USA-states", z=cov["pct"],
         zmin=0, zmax=100, colorscale=SCALE,
         marker_line_color="white", marker_line_width=0.8,
         colorbar=dict(
-            title=dict(text="Coverage<br> ", font=dict(size=13, color=INK2)),
+            title=dict(text="Coverage<br> ", font=dict(size=22, color=INK2)),
             tickmode="array", tickvals=[0, 30, 70, 100],
-            ticktext=["0%", "30%", "70%", "100%"], ticklen=8,
-            tickcolor=MUTED, thickness=14, len=0.75, y=0.5, x=1.0,
-            tickfont=dict(size=12, color=INK2), outlinewidth=0),
+            ticktext=["0%", "30%", "70%", "100%"], ticklen=10,
+            tickcolor=MUTED, thickness=22, len=0.75, y=0.5, x=1.0,
+            tickfont=dict(size=22, color=INK2), outlinewidth=0),
         customdata=cov[["matched_facilities", "echo_active_major_facilities"]],
         hovertemplate="%{location}: %{z:.0f}%% (%{customdata[0]}/%{customdata[1]})<extra></extra>",
     ))
@@ -69,7 +73,7 @@ def build_map(cov: pd.DataFrame, title: bool = True) -> go.Figure:
         label = f"{st_} {pct:.0f}%" if pct == 0 else f"{pct:.0f}%"
         fig.add_trace(go.Scattergeo(
             lat=[lat], lon=[lon], mode="text", text=[label],
-            textfont=dict(size=13, color="white" if pct > 55 else INK,
+            textfont=dict(size=24, color="white" if pct > 55 else INK,
                           family="Arial"),
             showlegend=False, hoverinfo="skip"))
 
@@ -79,12 +83,12 @@ def build_map(cov: pd.DataFrame, title: bool = True) -> go.Figure:
         fig.add_annotation(
             xref="paper", yref="paper", x=1.045, y=y0 + span * (lo + hi) / 200,
             text=f"<b>{name}</b><br>{rng}", showarrow=False, align="left",
-            xanchor="left", font=dict(size=12, color=INK2))
+            xanchor="left", font=dict(size=20, color=INK2))
 
     fig.update_geos(scope="usa", bgcolor="white", lakecolor="white",
                     showlakes=True, subunitcolor="white")
     layout = dict(
-        width=1640, height=840, margin=dict(l=10, r=240, t=88 if title else 20, b=40),
+        width=1640, height=840, margin=dict(l=10, r=330, t=88 if title else 20, b=48),
         paper_bgcolor="white", font=dict(family="Arial"),
     )
     if title:
@@ -97,10 +101,10 @@ def build_map(cov: pd.DataFrame, title: bool = True) -> go.Figure:
     else:
         fig.add_annotation(
             xref="paper", yref="paper", x=0.0, y=-0.02, xanchor="left", yanchor="top",
-            showarrow=False, font=dict(size=12, color=MUTED), align="left",
-            text=(f"National: {national_m:,} of {national_t:,} ECHO active major facilities "
+            showarrow=False, font=dict(size=18, color=MUTED), align="left",
+            text=(f"National: {national_m:,} of {national_t:,} ECHO active major {population} "
                   f"matched ({national_m/national_t:.1%}). White = no matched facilities "
-                  f"(KS, NE, DE, DC). Puerto Rico (1 of 44) not shown."))
+                  f"(KS, NE, DE, DC). Puerto Rico ({pr_m} of {pr_t}) not shown."))
     fig.update_layout(**layout)
     return fig
 

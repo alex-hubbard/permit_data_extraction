@@ -35,6 +35,10 @@ from make_echo_coverage_map import build_map, load_coverage  # noqa: E402
 
 ANALYSIS = ROOT / "data/processed/analysis"
 DEFAULT_OUT = ROOT / "docs/docs/figures"
+# Population the coverage tables describe. "mfg" reads the manufacturing-only
+# tables written by manuscript_mfg_benchmark.py (3-digit subsectors in panel c);
+# "all" reads the all-sector tables of benchmark_coverage_vs_echo.py.
+POPULATION = "mfg"
 
 # ---- palette (one blue hue for magnitude; gray for de-emphasis) -------------
 SURFACE = "#ffffff"
@@ -84,9 +88,8 @@ def _panel_letter(ax, letter: str, x: float = -0.18) -> None:
 # =============================================================================
 STAGES = [
     ("Public permit sources", None,
-     "EPA permit hub · about 40 state and local agency portals (static HTML pages to "
-     "JavaScript applications) · state document indexes queried per facility for "
-     "data-center permits"),
+     "EPA permit hub · about 43 state and local agency portals (static HTML pages to "
+     "JavaScript applications) · agency document indexes searched by facility type"),
     ("1  Acquisition", "Section 2.1",
      "Agentic crawler (Selenium page rendering, optional LLM scoring of ambiguous links, "
      "direct HTTP fetch with browser-driven fallback) · 55 state-specific download "
@@ -102,14 +105,14 @@ STAGES = [
     ("4  Post-processing", "Consolidation · Section 2.4",
      "Parse operating and run hours · normalize fuel types, ZIP codes and dates · infer "
      "capacity from unit descriptions · facility-level deduplication · industry code "
-     "resolution with provenance (Section 5.2) · automated QC (Section 4.3)"),
+     "resolution with provenance (Section 5.2) · equipment classification · automated QC"),
 ]
 ARTIFACTS = [  # sits on the arrow leaving stage i (index into STAGES)
     None,
-    "PDF corpus · more than 118,000 permit documents",
+    "PDF corpus · about 111,000 distinct permit documents",
     "One text file per PDF · filename is the stable key joining PDF, text and records",
     "One JSON object per document · general permit fields + array of emission units",
-    "Release table · 1,621,542 records from 74,017 documents · 52 fields · CSV and Excel",
+    "Release table · 50 fields · 1,736,283 records · manufacturing subset: 1,178,967 records",
 ]
 
 
@@ -174,7 +177,9 @@ def figure1(out_dir: Path) -> None:
 # =============================================================================
 def figure2(out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    fig = build_map(load_coverage(), title=False)
+    fig = build_map(load_coverage(ANALYSIS / "coverage_vs_echo_majors.csv"), title=False,
+                    population=("manufacturing facilities" if POPULATION == "mfg"
+                                else "facilities"))
     for ext in ("png", "pdf"):
         p = out_dir / f"fig2_echo_coverage_map.{ext}"
         fig.write_image(str(p), scale=2 if ext == "png" else 1)
@@ -187,12 +192,15 @@ def figure2(out_dir: Path) -> None:
 SHORT_SECTOR = {
     "Mining/Oil & Gas": "Mining, oil & gas", "Admin/Waste Mgmt": "Admin. & waste",
     "Wholesale Trade": "Wholesale trade", "Public Administration": "Public admin.",
+    "Transportation equipment": "Transportation eq.", "Petroleum & coal products": "Petroleum & coal",
+    "Miscellaneous manufacturing": "Misc. manufacturing", "Beverage & tobacco": "Beverage & tobacco",
+    "Nonmetallic minerals": "Nonmetallic minerals",
 }
 LABEL_STATES = ["CA", "TX", "OH", "IN", "LA", "NJ", "KS", "NE", "OR", "AZ", "DE"]
 LABEL_OFFSETS = {  # (dx, dy) in points; tuned by eye for the current data
     "CA": (5, -5), "TX": (5, 4), "OH": (3, -21), "IN": (5, 2), "LA": (-5, 3),
-    "NJ": (5, -2), "KS": (5, -3), "NE": (5, 3), "OR": (5, -2),
-    "AZ": (5, -3), "DE": (-5, 0),
+    "NJ": (5, 4), "KS": (5, -4), "NE": (5, 4), "OR": (5, -2),
+    "AZ": (5, -5), "DE": (-5, 0),
 }
 LEADER_STATES = {"OH"}   # labels moved into open space, joined by a hairline
 
@@ -213,10 +221,22 @@ def _county_quartiles(cbp: pd.DataFrame) -> pd.DataFrame:
 def figure3(out_dir: Path) -> None:
     asm = pd.read_csv(ANALYSIS / "asm_representativeness_state.csv").dropna(subset=["asm_valadd"])
     cbp = pd.read_csv(ANALYSIS / "cbp_representativeness_county.csv", dtype={"fips": str})
-    nai = pd.read_csv(ANALYSIS / "coverage_by_naics.csv")
+    if POPULATION == "mfg":
+        nai = pd.read_csv(ANALYSIS / "coverage_by_naics3.csv", dtype={"naics3": str})
+        nai = nai.rename(columns={"naics3": "code"})
+        y_label = "Share of ECHO manufacturing majors matched"
+        legend_big, legend_small = ("Subsector ≥ 5% of manufacturing majors",
+                                    "Subsector 1–5% of manufacturing majors")
+    else:
+        nai = pd.read_csv(ANALYSIS / "coverage_by_naics.csv")
+        nai = nai.dropna(subset=["naics2"])
+        nai["code"] = nai["naics2"].astype(int).astype(str)
+        y_label = "Share of ECHO major facilities matched"
+        legend_big, legend_small = ("Sector ≥ 5% of ECHO universe",
+                                    "Sector 1–5% of ECHO universe")
 
     fig, axes = plt.subplots(1, 3, figsize=(7.5, 2.75),
-                             gridspec_kw=dict(width_ratios=[1.3, 1.0, 1.15], wspace=0.95))
+                             gridspec_kw=dict(width_ratios=[1.3, 0.9, 1.0], wspace=1.25))
 
     # ---- (a) state coverage vs manufacturing value added ---------------------
     ax = axes[0]
@@ -243,7 +263,7 @@ def figure3(out_dir: Path) -> None:
     ax.set_ylim(-8, 103); ax.set_yticks([0, 30, 70, 100])
     ax.set_yticklabels(["0%", "30%", "70%", "100%"])
     ax.set_xlabel("Manufacturing value added, 2021 (ASM)")
-    ax.set_ylabel("Share of ECHO major facilities matched")
+    ax.set_ylabel(y_label)
     for lvl, lab in ((15, "sparse"), (50, "partial"), (85, "well covered")):
         ax.text(1.02, lvl / 100, lab, transform=ax.transAxes, fontsize=5.8,
                 color=MUTED, va="center", ha="left", rotation=90)
@@ -271,26 +291,41 @@ def figure3(out_dir: Path) -> None:
 
     # ---- (c) representation ratio by two-digit NAICS sector ------------------
     ax = axes[2]
-    sec = nai.dropna(subset=["naics2"]).copy()
-    sec["naics2"] = sec["naics2"].astype(int).astype(str)
+    sec = nai.copy()
     sec = sec[(sec["sector"] != "Unknown/blank") & (sec["share_of_echo_universe"] >= 0.01)]
     sec = sec.sort_values("share_of_echo_universe", ascending=True)
     big = sec["share_of_echo_universe"] >= 0.05
-    labels = [f"{SHORT_SECTOR.get(s, s)} ({n})" for s, n in zip(sec["sector"], sec["naics2"])]
+    labels = [f"{SHORT_SECTOR.get(s, s)} ({n})" for s, n in zip(sec["sector"], sec["code"])]
     ys = np.arange(len(sec))
     colors = [BLUE if b else MUTED for b in big]
-    ax.barh(ys, sec["representation_ratio"], height=0.56, color=colors, zorder=3)
-    ax.axvline(1.0, color=INK2, lw=0.6, zorder=4)
-    for yi, (v, b) in enumerate(zip(sec["representation_ratio"], big)):
-        if b:
-            ax.text(v + 0.03, yi, f"{v:.2f}", va="center", ha="left", fontsize=6.2, color=INK2)
-    ax.set_yticks(ys); ax.set_yticklabels(labels)
-    ax.set_xlim(0, 1.5); ax.set_xticks([0, 0.5, 1.0, 1.5])
-    ax.set_xlabel("Representation ratio\n(matched share ÷ ECHO share)")
-    ax.tick_params(axis="y", length=0)
+    from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
-    ax.legend(handles=[Patch(color=BLUE, label="Sector ≥ 5% of ECHO universe"),
-                       Patch(color=MUTED, label="Sector 1–5% of ECHO universe")],
+    extra_handles = []
+    if "coverage" in sec.columns:
+        # coverage within each subsector: matched facilities / ECHO facilities (a share, never above 100%)
+        cov = sec["coverage"] * 100
+        national = 100 * nai["matched_facilities"].sum() / nai["echo_active_major_facilities"].sum()
+        ax.barh(ys, cov, height=0.56, color=colors, zorder=3)
+        ax.axvline(national, color=INK2, lw=0.6, zorder=4)
+        for yi, (v, b) in enumerate(zip(cov, big)):
+            if b:
+                ax.text(v + 1.5, yi, f"{v:.0f}%", va="center", ha="left", fontsize=6.2, color=INK2)
+        ax.set_xlim(0, 100); ax.set_xticks([0, 25, 50, 75, 100])
+        ax.set_xticklabels(["0%", "25%", "50%", "75%", "100%"])
+        ax.set_xlabel("Share of the subsector's ECHO manufacturing\nfacilities matched by the dataset")
+        extra_handles = [Line2D([0], [0], color=INK2, lw=0.6, label=f"All manufacturing ({national:.1f}%)")]
+    else:
+        ax.barh(ys, sec["representation_ratio"], height=0.56, color=colors, zorder=3)
+        ax.axvline(1.0, color=INK2, lw=0.6, zorder=4)
+        for yi, (v, b) in enumerate(zip(sec["representation_ratio"], big)):
+            if b:
+                ax.text(v + 0.03, yi, f"{v:.2f}", va="center", ha="left", fontsize=6.2, color=INK2)
+        ax.set_xlim(0, 1.5); ax.set_xticks([0, 0.5, 1.0, 1.5])
+        ax.set_xlabel("Representation ratio\n(matched share ÷ ECHO share)")
+    ax.set_yticks(ys); ax.set_yticklabels(labels)
+    ax.tick_params(axis="y", length=0)
+    ax.legend(handles=[Patch(color=BLUE, label=legend_big),
+                       Patch(color=MUTED, label=legend_small)] + extra_handles,
               loc="lower left", bbox_to_anchor=(0.0, 1.0), frameon=False,
               handlelength=1.0, handleheight=0.8, borderaxespad=0.0, labelspacing=0.3)
     _style_axes(ax, "x")
@@ -303,7 +338,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Build manuscript figures.")
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
     ap.add_argument("--only", type=int, choices=[1, 2, 3], help="build one figure only")
+    ap.add_argument("--population", choices=["mfg", "all"], default="mfg",
+                    help="coverage population: manufacturing majors (default) or all majors")
     args = ap.parse_args()
+    global ANALYSIS, POPULATION
+    POPULATION = args.population
+    if POPULATION == "mfg":
+        ANALYSIS = ANALYSIS / "mfg_benchmark"
     builders = {1: figure1, 2: figure2, 3: figure3}
     for k in ([args.only] if args.only else [1, 2, 3]):
         builders[k](args.out_dir)

@@ -48,6 +48,42 @@ REV_PATTERNS = {
 
 OHIO_FID_RX = re.compile(r"\b(\d{10})\b")
 OHIO_DATE_RX = re.compile(r" - (\d{6,8}) - ")
+OHIO_INDEX = Path("data/raw/ohio_epa_air_permits/ohio_epa_air_permits_index.csv")
+OHIO_INDEX_DATE_RX = re.compile(r" - (\d{1,2})/(\d{1,2})/(\d{4}) - ")
+
+
+def _ohio_index_dates():
+    """docid -> YYYYMMDD from the eDocs index, whose titles carry the date
+    with separators. The filename date has none (``1172014`` is 1/17/2014 or
+    11/7/2014), so it cannot be ordered reliably on its own."""
+    dates = {}
+    if not OHIO_INDEX.exists():
+        return dates
+    with open(OHIO_INDEX, encoding="utf-8", errors="ignore") as f:
+        for r in csv.DictReader(f):
+            m = OHIO_INDEX_DATE_RX.search(r.get("title", ""))
+            if m:
+                mm, dd, yy = m.groups()
+                dates[r["docid"]] = f"{yy}{int(mm):02d}{int(dd):02d}"
+    return dates
+
+
+def _ohio_filename_date(stem):
+    """Best-effort YYYYMMDD from the unseparated filename date (fallback only)."""
+    d = OHIO_DATE_RX.search(stem)
+    if not d:
+        return "00000000"
+    raw = d.group(1)
+    yy, md = raw[-4:], raw[:-4]
+    if len(md) == 4:
+        mm, dd = md[:2], md[2:]
+    elif len(md) == 3:
+        mm, dd = ("0" + md[0], md[1:]) if int(md[:2]) > 12 or int(md[1:]) > 31 else (md[:2], "0" + md[2])
+    elif len(md) == 2:
+        mm, dd = "0" + md[0], "0" + md[1]
+    else:
+        mm, dd = "01", "01"
+    return f"{yy}{mm}{dd}"
 
 
 def ohio_dedupe(stems):
@@ -55,7 +91,13 @@ def ohio_dedupe(stems):
     facilities, median 2 and up to 168 per facility, including drafts and
     non-permit correspondence). Keep the latest-dated APPROVAL doc per
     facility ID — 23.5K -> ~4.7K docs with no loss of current-permit coverage.
+
+    Dates come from the eDocs index (slashed) and fall back to the filename.
+    The 2026-08 lane ordered the raw filename digits by (length, string),
+    which picked an older final at ~1,400 facilities; those were re-extracted
+    in the 2026-10 backlog lane.
     """
+    index_dates = _ohio_index_dates()
     best = {}
     for s in stems:
         if "APPROVAL" not in s.upper():
@@ -63,9 +105,8 @@ def ohio_dedupe(stems):
         m = OHIO_FID_RX.search(s)
         if not m:
             continue
-        d = OHIO_DATE_RX.search(s)
-        date = d.group(1) if d else "0"
-        key = (len(date), date)
+        docid = s.split("_", 1)[0]
+        key = (index_dates.get(docid) or _ohio_filename_date(s), docid)
         if m.group(1) not in best or key > best[m.group(1)][0]:
             best[m.group(1)] = (key, s)
     return {v[1] for v in best.values()}
