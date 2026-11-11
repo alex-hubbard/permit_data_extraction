@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 REPO_URL = "https://github.com/alex-hubbard/permit_data_extraction"
-DOI = "10.5281/zenodo.23679528"
+DOI = "10.5281/zenodo.23679527"  # concept DOI: resolves to the latest version
 
 
 def main(out: Path) -> None:
@@ -28,7 +28,7 @@ def main(out: Path) -> None:
 
 Release `{m['release']}`, built {m['built']} from `{m['source']}`.
 
-DOI: https://doi.org/{DOI}
+DOI (all versions): https://doi.org/{DOI}
 
 Each row describes one emission unit (a boiler, process heater, engine, tank, coating line, ...)
 listed in a state or local Title V air permit, as extracted by large language models; or
@@ -77,8 +77,9 @@ still point to a single plant, and Title V permits are themselves public records
 - Unit counts are what the permit lists, not an inventory of physical equipment: some permits
   group several pieces of equipment under one unit, and others list control devices as units.
 - `Equipment Category`, `Equipment Subcategory` and `Equipment Designation` (combustion /
-  non-combustion / unknown) are rule-based rollups of
-  the free-text `Unit Type`.
+  electric heating / process and storage / other) are rule-based rollups of
+  the free-text `Unit Type`. `electric heating` counts only heating equipment the permit states
+  is electric, so it is a lower bound.
 
 ## Code
 

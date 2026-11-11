@@ -48,7 +48,7 @@ VERSION = "v5g"
 READY_PARQUET = REPO / "data/processed/dashboard/permits.parquet"
 # de-identified release (scripts/deidentify_release.py); the bucket is public,
 # so nothing with facility names, addresses, permit numbers or filenames goes here
-RELEASE_DIR = REPO / "data/processed/release/v5g_deid"
+RELEASE_DIR = REPO / "data/processed/release/v5g_deid_r2"
 FULL_PARQUET = RELEASE_DIR / "permit_equipment_full.parquet"
 UNION_CSV = RELEASE_DIR / "permit_equipment_full.csv.gz"
 RELEASE_EXTRAS = ["permit_equipment_manufacturing.csv.gz", "data_dictionary.csv"]

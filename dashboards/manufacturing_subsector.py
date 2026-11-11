@@ -634,12 +634,19 @@ def _load_df(data_path_str: str) -> pd.DataFrame:
 
 
 @st.cache_resource(max_entries=4, show_spinner=False)
-def get_subset(code: str, states: tuple, data_path_str: str) -> pd.DataFrame:
+def get_subset(code: str, states: tuple, data_path_str: str,
+               designations: tuple = ()) -> pd.DataFrame:
     """Filtered view of the dataset, shared (not copied) across reruns."""
     sub = filter_by_option(_load_df(data_path_str), code)
     if states:
         sub = sub[sub["Facility State Abbreviation"].isin(states)]
+    if designations and "Equipment Designation" in sub.columns:
+        sub = sub[sub["Equipment Designation"].isin(designations)]
     return sub
+
+
+# Sidebar order of the Equipment Designation filter (values of the release column).
+DESIGNATION_ORDER = ["combustion", "electric heating", "process and storage", "other"]
 
 
 @st.cache_data(show_spinner=False)
@@ -711,11 +718,12 @@ def _make_model_counts(sub: pd.DataFrame, n: int) -> pd.DataFrame:
 
 
 @st.cache_data(max_entries=12, show_spinner="Crunching view…")
-def view_aggregates(code: str, states: tuple, data_path_str: str) -> dict:
+def view_aggregates(code: str, states: tuple, data_path_str: str,
+                    designations: tuple = ()) -> dict:
     """Everything the charts need for one (subsector, states) selection,
     computed in a single pass and cached. The heavy per-rerun groupbys were
     what made the app crawl at 1.1M rows."""
-    sub = get_subset(code, states, data_path_str)
+    sub = get_subset(code, states, data_path_str, designations)
     out: dict = {"n": len(sub)}
 
     # observed=True everywhere: Site Key is categorical, and the default
@@ -1123,7 +1131,7 @@ def _release_link(label: str, url: str) -> bool:
 
 
 def render_downloads(code: str, state_filter: list[str], data_path_str: str,
-                     n: int, cols: list[str]) -> None:
+                     n: int, cols: list[str], designations: tuple = ()) -> None:
     st.markdown("### Download")
     base = PUBLIC_RELEASE_BASE
     ver = PUBLIC_RELEASE_VERSION
@@ -1144,6 +1152,9 @@ def render_downloads(code: str, state_filter: list[str], data_path_str: str,
             "full-dataset files carry the release schema."
             + (" Subsector files are not split by state; for a state-filtered "
                "extract use the on-demand export below." if state_filter else "")
+            + (" The files are not filtered by equipment designation; filter on the "
+               "Equipment Designation column, or use the on-demand export below."
+               if designations else "")
         )
     else:
         st.caption("Pre-built download files are not reachable right now.")
@@ -1159,6 +1170,8 @@ def render_downloads(code: str, state_filter: list[str], data_path_str: str,
     slug = "permit_units_" + (code.lower() if code else "all")
     if state_filter:
         slug += "_" + "-".join(s.lower() for s in sorted(state_filter)[:5])
+    if designations:
+        slug += "_" + "-".join(d.replace(" ", "-") for d in designations)
 
     prepare = st.checkbox(
         f"Prepare an on-demand export of this selection ({n:,} rows × {len(cols)} columns)",
@@ -1166,7 +1179,7 @@ def render_downloads(code: str, state_filter: list[str], data_path_str: str,
     )
     if not prepare:
         return
-    sub = get_subset(code, tuple(state_filter), data_path_str)
+    sub = get_subset(code, tuple(state_filter), data_path_str, designations)
     export = sub[cols].copy()
     # Filtered frames inherit the full dataset's category dictionaries, which
     # bloats the written file; drop the unused entries first.
@@ -1270,8 +1283,21 @@ def main() -> None:
             & VALID_STATE_CODES
         )
         state_filter = st.multiselect("States", options=states_available, default=[])
+        designation_filter: list[str] = []
+        if "Equipment Designation" in df.columns:
+            present = set(df["Equipment Designation"].dropna().astype(str).unique())
+            designation_filter = st.multiselect(
+                "Equipment designation",
+                options=[d for d in DESIGNATION_ORDER if d in present],
+                default=[],
+                help="Combustion: the unit burns fuel. Electric heating: heating equipment "
+                     "the permit states is electric (a lower bound). Process and storage: "
+                     "other equipment that does not burn fuel, such as tanks, material "
+                     "handling and coating lines. Other: not enough information to decide.",
+            )
 
-    view = view_aggregates(chosen_code, tuple(state_filter), data_path_str)
+    view = view_aggregates(chosen_code, tuple(state_filter), data_path_str,
+                           tuple(designation_filter))
 
     st.subheader(option_display_name(chosen_code))
     if chosen_code == ALL_CODE:
@@ -1331,7 +1357,7 @@ def main() -> None:
     render_data_table(view["table_head"], view["n"], len(view["export_cols"]))
 
     render_downloads(chosen_code, state_filter, data_path_str,
-                     view["n"], view["export_cols"])
+                     view["n"], view["export_cols"], tuple(designation_filter))
 
 
 if __name__ == "__main__":

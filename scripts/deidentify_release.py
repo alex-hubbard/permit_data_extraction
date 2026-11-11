@@ -453,9 +453,10 @@ def data_dictionary(cols: list[str], out: Path) -> None:
                            "no facility. Counts of distinct Facility IDs reproduce the facility "
                            "counts in the paper", "text")
     desc["Latest Facility Document ID"] = ("Document ID of the document kept for the facility in "
-                                           "the deduplication (Section 2.3)", "text")
-    desc["Equipment Designation"] = ("combustion, non-combustion, or unknown: whether the unit burns "
-                                     "fuel (named Combustion Source in pre-release files)", "text")
+                                           "the deduplication (Section 2.4)", "text")
+    desc["Equipment Designation"] = ("combustion, electric heating, process and storage, or other "
+                                     "(electric heating counts only units the permit states are "
+                                     "electric)", "text")
     with out.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["column", "description", "type"])

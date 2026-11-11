@@ -13,7 +13,7 @@ carries ~62,000 distinct normalised strings ("boiler", "boiler/process heater",
   * ``Equipment Category``     16 coarse categories plus "Unspecified / generic"
         (boilers and process heaters are deliberately separate: different EIS
         codes, different standards, different decarbonisation pathways)
-  * ``Equipment Designation``  combustion / non-combustion / unknown (named Combustion Source before 2026-10-23, Equipment Type until 2026-10-26)
+  * ``Equipment Designation``  combustion / electric heating / process and storage / other (three values combustion / non-combustion / unknown until 2026-11-11; named Combustion Source before 2026-10-23, Equipment Type until 2026-10-26)
   * ``Equipment Category Basis`` which field decided it: unit_type,
         unit_description, capacity_unit, or none
 
@@ -30,12 +30,15 @@ non-emergency / unspecified) and the heater split (process vs comfort) are
 decided from Unit Type and Unit Description together, reusing the regexes from
 scripts/build_dc_generation_sites.py so the two tables agree.
 
-Combustion flag: each fine category has a default.  Row-level overrides:
-fuel-fired-by-design categories flip to non-combustion when the Fuel Type or
-unit text says electric / steam-heated and no burnable fuel is named; generic
-and "other process equipment" categories flip to combustion when a burnable
-fuel is named or the unit text says fired / burner / combustion; rows with no
-Unit Type, no Unit Description and no fuel are "unknown".
+Equipment designation: each fine category has a default (combustion, or
+process and storage).  Row-level overrides: fuel-fired-by-design categories
+leave combustion when the Fuel Type or unit text says electric / steam-heated /
+no fuel and no burnable fuel is named -- to "electric heating" when the permit
+states the unit is electric and the text carries no sign of firing, otherwise
+to "process and storage"; generic and "other process equipment" categories
+flip to combustion when a burnable fuel is named or the unit text says fired /
+burner / combustion; rows with no Unit Type, no Unit Description and no fuel
+are "other".
 
 Usage (from the repo root):
     python scripts/classify_unit_types.py \
@@ -69,7 +72,12 @@ OUT_COLS = ["Equipment Category", "Equipment Subcategory", "Equipment Designatio
 # --------------------------------------------------------------------------- #
 # Taxonomy: fine -> (coarse, EIS unit-type code, default combustion flag)
 # --------------------------------------------------------------------------- #
-C, N = "combustion", "non-combustion"
+# Equipment Designation values (2026-11-11, agreed with P. Rao): the former
+# "non-combustion" is split into "electric heating" (heating equipment the
+# permit states is electric) and "process and storage" (everything else that
+# does not burn fuel); the former "unknown" is "other".
+C, N = "combustion", "process and storage"
+E, O = "electric heating", "other"
 TAXONOMY: dict[str, tuple[str, int | None, str]] = {
     # boilers (steam / hot water, indirect) -- the MACT DDDDD "boiler or process
     # heater" wording rolls up here because that population is mostly boilers
@@ -392,6 +400,14 @@ ELECTRIC_FUEL_RX = re.compile(r"electric|steam\b|^\s*none|^\s*n/?a\b|not applica
 ELECTRIC_TEXT_RX = re.compile(r"\belectric(?:al)?\b(?! generat| gen\b| utility| arc weld| power| energy| motor| drive|ity gen)|"
                               r"electrically[- ]?(?:heated|powered|fired)|induction (?:furnace|heat|melt)|electric arc|\beaf\b|"
                               r"resistance heat|steam[- ](?:heated|coil|tube|jacket)|hot water coil|microwave|electron beam|\buv[- ]cur", re.I)
+# Stated-electric evidence only (no steam, hot water or "no fuel" entries): the
+# electric heating designation counts units the permit says are electric.
+ELECTRIC_HEAT_FUEL_RX = re.compile(r"electric", re.I)
+ELECTRIC_HEAT_TEXT_RX = re.compile(
+    r"\belectric(?:al)?\b(?! generat| gen\b| utility| arc weld| power| energy| motor| drive|ity gen"
+    r"| ignit| start| spark| fan| blower| actuator| control| panel| service| meter)|"
+    r"electrically[- ]?(?:heated|powered|fired)|induction (?:furnace|heat|melt)|electric arc|\beaf\b|"
+    r"resistance heat|microwave|electron beam|\buv[- ]cur", re.I)
 FIRED_TEXT_RX = re.compile(r"\bfired\b|burner|combust|mmbtu|btu/hr|btu per hour|heat input", re.I)
 
 
@@ -506,10 +522,15 @@ def combustion_flag(fine: pd.Series, ut: pd.Series, desc: pd.Series, fuel: pd.Se
     electric = (fuel.str.contains(ELECTRIC_FUEL_RX) | txt.str.contains(ELECTRIC_TEXT_RX)) & ~burnable
     fired_text = txt.str.contains(FIRED_TEXT_RX) | cap.str.contains(HEAT_RX)
     flag[fine.isin(ELECTRIC_OVERRIDABLE) & electric] = N
+    # of those, the units the permit states are electric (and that carry no
+    # sign of firing) are electric heating; steam-heated, hot-water and
+    # "no fuel" units stay in process and storage
+    stated = fuel.str.contains(ELECTRIC_HEAT_FUEL_RX) | txt.str.contains(ELECTRIC_HEAT_TEXT_RX)
+    flag[fine.isin(ELECTRIC_OVERRIDABLE) & electric & stated & ~fired_text] = E
     flag[fine.isin(FUEL_OVERRIDABLE_GENERIC) & (burnable | fired_text)] = C
     flag[fine.isin(FUEL_OVERRIDABLE_FIRED_ONLY) & fired_text] = C
     blank = (ut == "") & (desc == "") & (fuel.str.strip() == "")
-    flag[(fine == "Unspecified") & blank] = "unknown"
+    flag[(fine == "Unspecified") & blank] = O
     return flag
 
 
